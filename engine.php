@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.1.0 — Central Commercial Realty
+ * CC Listing Engine v0.1.1 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.1.0';
+const VERSION  = '0.1.1';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -188,7 +188,7 @@ function run_sync(): array {
                 (string)($l['PropertySubType'] ?? ''),
                 (string)($l['TransactionType'] ?? ''),
                 is_array($l['BusinessType'] ?? null) ? implode(', ', $l['BusinessType']) : (string)($l['BusinessType'] ?? ''),
-                (string)($l['MlsStatus'] ?? 'Active'),
+                (string)($l['StandardStatus'] ?? 'Active'),
                 (string)($l['ListingId'] ?? $key),
                 (string)($l['PublicRemarks'] ?? ''),
                 (string)($l['ListOfficeName'] ?? ''),
@@ -288,7 +288,8 @@ $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
 
 if ($path === '/health') {
     $n = (int)db()->query("SELECT COUNT(*) FROM listings WHERE status = 'Active'")->fetchColumn();
-    jout(['ok' => true, 'engine' => VERSION, 'active_listings' => $n, 'last_sync' => meta_get('last_sync'), 'last_result' => meta_get('last_sync_result')]);
+    $t = (int)db()->query('SELECT COUNT(*) FROM listings')->fetchColumn();
+    jout(['ok' => true, 'engine' => VERSION, 'active_listings' => $n, 'total_rows' => $t, 'last_sync' => meta_get('last_sync'), 'last_result' => meta_get('last_sync_result')]);
 }
 
 if ($path === '/v1/sync') {
