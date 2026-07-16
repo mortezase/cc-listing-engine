@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.1.2 — Central Commercial Realty
+ * CC Listing Engine v0.1.3 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.1.2';
+const VERSION  = '0.1.3';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -141,12 +141,13 @@ function sync_photos(array $keys, string $token): void {
     foreach ($byKey as $k => $urls) $st->execute([json_encode($urls), $k]);
 }
 
-function run_sync(): array {
+function run_sync(int $max_pages = 15): array {
     $token = env('IDX_TOKEN');
     if (!$token) return ['error' => 'IDX_TOKEN not set'];
-    if (meta_get('sync_lock') && time() - (int)meta_get('sync_lock') < 1800) return ['skipped' => 'lock'];
+    if (meta_get('sync_lock') && time() - (int)meta_get('sync_lock') < 300) return ['skipped' => 'lock'];
     meta_set('sync_lock', (string)time());
     set_time_limit(0);
+    ignore_user_abort(true);
 
     $last = meta_get('last_sync');
     $filter = "StandardStatus eq 'Active'";
@@ -167,8 +168,10 @@ function run_sync(): array {
             (SELECT lng FROM (SELECT lng FROM listings WHERE listing_key = ?) t3),
             (SELECT photos FROM (SELECT photos FROM listings WHERE listing_key = ?) t4), ?)");
 
-    while ($url && $pages < 400) {
-        $body = http_get_json($url, $token);
+    $err = null;
+    while ($url && $pages < $max_pages) {
+        try { $body = http_get_json($url, $token); }
+        catch (Throwable $e) { $err = $e->getMessage(); break; }
         foreach (($body['value'] ?? []) as $l) {
             $key = $l['ListingKey'] ?? '';
             if (!$key) continue;
@@ -205,14 +208,16 @@ function run_sync(): array {
         }
         foreach (array_chunk($batch, 20) as $chunk) sync_photos($chunk, $token);
         $batch = [];
+        // Save progress EVERY page — a crash or restart never loses ground
+        if ($maxmod) meta_set('last_sync', gmdate('Y-m-d H:i:s', strtotime($maxmod)));
         $url = $body['@odata.nextLink'] ?? null;
         $pages++;
     }
-    if ($maxmod) meta_set('last_sync', gmdate('Y-m-d H:i:s', strtotime($maxmod)));
-    elseif (!$last) meta_set('last_sync', gmdate('Y-m-d H:i:s'));
+    $more = ($url !== null);
+    if (!$more && !$err && !meta_get('last_sync')) meta_set('last_sync', gmdate('Y-m-d H:i:s'));
     meta_set('sync_lock', '0');
-    meta_set('last_sync_result', "$count upserted, $pages pages, " . gmdate('Y-m-d H:i:s'));
-    return ['upserted' => $count, 'pages' => $pages, 'more' => $pages >= 400];
+    meta_set('last_sync_result', "$count upserted, $pages pages" . ($err ? ", ERROR: $err" : '') . ', ' . gmdate('Y-m-d H:i:s'));
+    return ['upserted' => $count, 'pages' => $pages, 'more' => $more || (bool)$err, 'error' => $err];
 }
 
 /* ---------------- QUERY API ---------------- */
@@ -294,7 +299,7 @@ if ($path === '/health') {
 
 if ($path === '/v1/sync') {
     if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
-    jout(run_sync());
+    jout(run_sync(min(50, max(1, (int)($_GET['pages'] ?? 15)))));
 }
 
 require_api_key();
