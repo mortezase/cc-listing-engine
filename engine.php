@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.1.1 — Central Commercial Realty
+ * CC Listing Engine v0.1.2 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.1.1';
+const VERSION  = '0.1.2';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -298,6 +298,44 @@ if ($path === '/v1/sync') {
 }
 
 require_api_key();
+
+if ($path === '/v1/probe') {
+    $vt = env('VOW_TOKEN');
+    if (!$vt) jout(['error' => 'VOW_TOKEN env not set on the engine'], 500);
+    set_time_limit(0);
+    $since = gmdate('Y-m-d\TH:i:s\Z', strtotime('-730 days'));
+    $count = function (string $filter) use ($vt) {
+        try {
+            $b = http_get_json(API_BASE . 'Property?' . http_build_query(['$filter' => $filter, '$top' => 0, '$count' => 'true'], '', '&', PHP_QUERY_RFC3986), $vt);
+            return $b['@odata.count'] ?? 'no-count';
+        } catch (Throwable $e) { return 'ERR ' . $e->getMessage(); }
+    };
+    $out = [];
+    $out['Sold (all types, 2y)']   = $count("MlsStatus eq 'Sold' and ModificationTimestamp gt $since");
+    $out['Leased (all types, 2y)'] = $count("MlsStatus eq 'Leased' and ModificationTimestamp gt $since");
+    // Discover PropertyType labels among Sold records
+    $types = [];
+    try {
+        $b = http_get_json(API_BASE . 'Property?' . http_build_query([
+            '$filter' => "MlsStatus eq 'Sold' and ModificationTimestamp gt $since",
+            '$top' => 300, '$select' => 'PropertyType',
+        ], '', '&', PHP_QUERY_RFC3986), $vt);
+        foreach (($b['value'] ?? []) as $v) { $pt = $v['PropertyType'] ?? '(null)'; $types[$pt] = ($types[$pt] ?? 0) + 1; }
+    } catch (Throwable $e) { $out['sample error'] = $e->getMessage(); }
+    arsort($types);
+    $out['PropertyType labels in 300 Sold samples'] = $types;
+    foreach (array_keys($types) as $pt) {
+        if (stripos($pt, 'residential') === false && stripos($pt, 'condo') === false) {
+            $out["Sold, PropertyType='$pt' (2y)"]   = $count("MlsStatus eq 'Sold' and PropertyType eq '$pt' and ModificationTimestamp gt $since");
+            $out["Leased, PropertyType='$pt' (2y)"] = $count("MlsStatus eq 'Leased' and PropertyType eq '$pt' and ModificationTimestamp gt $since");
+        }
+    }
+    try {
+        $b = http_get_json(API_BASE . 'Property?' . http_build_query(['$filter' => "MlsStatus eq 'Sold' and ModificationTimestamp gt $since", '$top' => 2, '$select' => 'MlsStatus,StandardStatus,PropertyType,PropertySubType,TransactionType,ClosePrice,CloseDate,BusinessType'], '', '&', PHP_QUERY_RFC3986), $vt);
+        $out['sample_sold_records'] = $b['value'] ?? [];
+    } catch (Throwable $e) {}
+    jout(['probe' => $out]);
+}
 
 if ($path === '/v1/listings') jout(q_listings());
 if (preg_match('#^/v1/listing/([A-Za-z0-9]+)$#', $path, $m)) jout(q_listing($m[1]));
