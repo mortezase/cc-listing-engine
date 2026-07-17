@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.1.3 — Central Commercial Realty
+ * CC Listing Engine v0.1.4 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.1.3';
+const VERSION  = '0.1.4';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -158,15 +158,12 @@ function run_sync(int $max_pages = 15): array {
     ], '', '&', PHP_QUERY_RFC3986);
 
     $count = 0; $pages = 0; $maxmod = ''; $batch = [];
+    $sel = db()->prepare("SELECT first_seen, lat, lng, photos FROM listings WHERE listing_key = ?");
     $up = db()->prepare("REPLACE INTO listings
         (listing_key, feed, list_price, price_unit, address, city, province, postal, property_type, property_subtype,
          transaction_type, business_type, status, mls_number, remarks, list_office, perm_adv, disp_addr, sqft,
          list_date, modified, first_seen, lat, lng, photos, raw)
-        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            COALESCE((SELECT first_seen FROM (SELECT first_seen FROM listings WHERE listing_key = ?) t), UTC_TIMESTAMP()),
-            (SELECT lat FROM (SELECT lat FROM listings WHERE listing_key = ?) t2),
-            (SELECT lng FROM (SELECT lng FROM listings WHERE listing_key = ?) t3),
-            (SELECT photos FROM (SELECT photos FROM listings WHERE listing_key = ?) t4), ?)");
+        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
     $err = null;
     while ($url && $pages < $max_pages) {
@@ -179,6 +176,8 @@ function run_sync(int $max_pages = 15): array {
             $yn = fn($v) => ($v === true || $v === 'Y' || $v === 'Yes' || $v === 'true' || $v === 1) ? 'Y' : (($v === null || $v === '') ? 'Y' : 'N');
             $unit = '';
             foreach (['ListPriceUnit', 'LeaseAmountFrequency'] as $uf) if (!empty($l[$uf]) && is_string($l[$uf])) { $unit = $l[$uf]; break; }
+            $sel->execute([$key]);
+            $prev = $sel->fetch() ?: ['first_seen' => gmdate('Y-m-d H:i:s'), 'lat' => null, 'lng' => null, 'photos' => null];
             $up->execute([
                 $key,
                 isset($l['ListPrice']) ? (float)$l['ListPrice'] : null,
@@ -200,7 +199,8 @@ function run_sync(int $max_pages = 15): array {
                 (string)($l['BuildingAreaTotal'] ?? ''),
                 !empty($l['OriginalEntryTimestamp']) ? gmdate('Y-m-d', strtotime($l['OriginalEntryTimestamp'])) : null,
                 isset($l['ModificationTimestamp']) ? gmdate('Y-m-d H:i:s', strtotime($l['ModificationTimestamp'])) : null,
-                $key, $key, $key, $key,
+                $prev['first_seen'] ?: gmdate('Y-m-d H:i:s'),
+                $prev['lat'], $prev['lng'], $prev['photos'],
                 pack_raw($l),
             ]);
             $batch[] = $key;
@@ -294,12 +294,18 @@ $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
 if ($path === '/health') {
     $n = (int)db()->query("SELECT COUNT(*) FROM listings WHERE status = 'Active'")->fetchColumn();
     $t = (int)db()->query('SELECT COUNT(*) FROM listings')->fetchColumn();
-    jout(['ok' => true, 'engine' => VERSION, 'active_listings' => $n, 'total_rows' => $t, 'last_sync' => meta_get('last_sync'), 'last_result' => meta_get('last_sync_result')]);
+    jout(['ok' => true, 'engine' => VERSION, 'active_listings' => $n, 'total_rows' => $t, 'last_sync' => meta_get('last_sync'), 'last_result' => meta_get('last_sync_result'), 'last_error' => meta_get('last_error')]);
 }
 
 if ($path === '/v1/sync') {
     if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
-    jout(run_sync(min(50, max(1, (int)($_GET['pages'] ?? 15)))));
+    try {
+        jout(run_sync(min(50, max(1, (int)($_GET['pages'] ?? 15)))));
+    } catch (Throwable $e) {
+        meta_set('sync_lock', '0');
+        meta_set('last_error', get_class($e) . ': ' . $e->getMessage() . ' @ line ' . $e->getLine());
+        jout(['error' => $e->getMessage(), 'line' => $e->getLine()], 500);
+    }
 }
 
 require_api_key();
