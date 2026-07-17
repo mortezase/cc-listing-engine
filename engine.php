@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.1.4 — Central Commercial Realty
+ * CC Listing Engine v0.1.5 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.1.4';
+const VERSION  = '0.1.5';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -163,7 +163,7 @@ function run_sync(int $max_pages = 15): array {
         (listing_key, feed, list_price, price_unit, address, city, province, postal, property_type, property_subtype,
          transaction_type, business_type, status, mls_number, remarks, list_office, perm_adv, disp_addr, sqft,
          list_date, modified, first_seen, lat, lng, photos, raw)
-        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
     $err = null;
     while ($url && $pages < $max_pages) {
