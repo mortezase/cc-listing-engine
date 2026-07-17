@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.1.5 — Central Commercial Realty
+ * CC Listing Engine v0.3.0 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.1.5';
+const VERSION  = '0.3.0';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -66,6 +66,11 @@ function ensure_schema(): void {
         KEY city (city), KEY status (status), KEY modified (modified), KEY price (list_price)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
     db()->exec("CREATE TABLE IF NOT EXISTS meta (k VARCHAR(60) PRIMARY KEY, v TEXT)");
+    foreach (["ALTER TABLE listings ADD COLUMN close_price DECIMAL(14,2) NULL",
+              "ALTER TABLE listings ADD COLUMN close_date DATE NULL",
+              "ALTER TABLE listings ADD INDEX close_date (close_date)"] as $ddl) {
+        try { db()->exec($ddl); } catch (Throwable $e) { /* already applied */ }
+    }
 }
 
 function meta_get($k, $d = null) {
@@ -121,7 +126,7 @@ function unpack_raw(?string $s): array {
 
 /* ---------------- SYNC ---------------- */
 
-function sync_photos(array $keys, string $token): void {
+function sync_photos(array $keys, string $token, int $cap = 12): void {
     if (!$keys) return;
     $flt = implode(' or ', array_map(fn($k) => "ResourceRecordKey eq '" . $k . "'", $keys));
     $url = API_BASE . 'Media?' . http_build_query([
@@ -135,7 +140,7 @@ function sync_photos(array $keys, string $token): void {
         $k = $m['ResourceRecordKey'] ?? '';
         $u = $m['MediaURL'] ?? '';
         if (!$k || !$u) continue;
-        if (count($byKey[$k] ?? []) < 12) $byKey[$k][] = $u;
+        if (count($byKey[$k] ?? []) < $cap) $byKey[$k][] = $u;
     }
     $st = db()->prepare("UPDATE listings SET photos = ? WHERE listing_key = ?");
     foreach ($byKey as $k => $urls) $st->execute([json_encode($urls), $k]);
@@ -217,6 +222,90 @@ function run_sync(int $max_pages = 15): array {
     if (!$more && !$err && !meta_get('last_sync')) meta_set('last_sync', gmdate('Y-m-d H:i:s'));
     meta_set('sync_lock', '0');
     meta_set('last_sync_result', "$count upserted, $pages pages" . ($err ? ", ERROR: $err" : '') . ', ' . gmdate('Y-m-d H:i:s'));
+    if (!$err) meta_set('last_error', '');
+    return ['upserted' => $count, 'pages' => $pages, 'more' => $more || (bool)$err, 'error' => $err];
+}
+
+/** VOW sync: residential + all closed/off-market records (2y window). Slim: 3 photos. */
+function run_vow_sync(int $max_pages = 15): array {
+    $token = env('VOW_TOKEN');
+    if (!$token) return ['error' => 'VOW_TOKEN not set'];
+    if (meta_get('vow_lock') && time() - (int)meta_get('vow_lock') < 300) return ['skipped' => 'lock'];
+    meta_set('vow_lock', (string)time());
+    set_time_limit(0);
+    ignore_user_abort(true);
+
+    $lookback = max(30, (int)env('VOW_DAYS', '730'));
+    $last = meta_get('vow_last');
+    $filter = "StandardStatus ne 'Active'";
+    $filter .= ' and ModificationTimestamp gt ' . gmdate('Y-m-d\TH:i:s\Z', $last ? strtotime($last) : strtotime("-$lookback days"));
+
+    $url = API_BASE . 'Property?' . http_build_query([
+        '$filter' => $filter, '$top' => 100, '$orderby' => 'ModificationTimestamp',
+    ], '', '&', PHP_QUERY_RFC3986);
+
+    $count = 0; $pages = 0; $maxmod = ''; $batch = []; $err = null;
+    $sel = db()->prepare("SELECT first_seen, lat, lng, photos FROM listings WHERE listing_key = ?");
+    $up = db()->prepare("REPLACE INTO listings
+        (listing_key, feed, list_price, price_unit, close_price, close_date, address, city, province, postal,
+         property_type, property_subtype, transaction_type, business_type, status, mls_number, remarks, list_office,
+         perm_adv, disp_addr, sqft, list_date, modified, first_seen, lat, lng, photos, raw)
+        VALUES (?, 'vow', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'Y', ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+
+    while ($url && $pages < $max_pages) {
+        try { $body = http_get_json($url, $token); }
+        catch (Throwable $e) { $err = $e->getMessage(); break; }
+        foreach (($body['value'] ?? []) as $l) {
+            $key = $l['ListingKey'] ?? '';
+            if (!$key) continue;
+            if (($l['ModificationTimestamp'] ?? '') > $maxmod) $maxmod = $l['ModificationTimestamp'];
+            $yn = fn($v) => ($v === true || $v === 'Y' || $v === 'Yes' || $v === 'true' || $v === 1) ? 'Y' : (($v === null || $v === '') ? 'Y' : 'N');
+            $unit = '';
+            foreach (['ListPriceUnit', 'LeaseAmountFrequency'] as $uf) if (!empty($l[$uf]) && is_string($l[$uf])) { $unit = $l[$uf]; break; }
+            $sel->execute([$key]);
+            $prev = $sel->fetch() ?: ['first_seen' => gmdate('Y-m-d H:i:s'), 'lat' => null, 'lng' => null, 'photos' => null];
+            $up->execute([
+                $key,
+                isset($l['ListPrice']) ? (float)$l['ListPrice'] : null,
+                $unit,
+                isset($l['ClosePrice']) ? (float)$l['ClosePrice'] : null,
+                !empty($l['CloseDate']) ? gmdate('Y-m-d', strtotime($l['CloseDate'])) : null,
+                (string)($l['UnparsedAddress'] ?? ''),
+                (string)($l['City'] ?? ''),
+                (string)($l['StateOrProvince'] ?? 'ON'),
+                (string)($l['PostalCode'] ?? ''),
+                (string)($l['PropertyType'] ?? ''),
+                (string)($l['PropertySubType'] ?? ''),
+                (string)($l['TransactionType'] ?? ''),
+                is_array($l['BusinessType'] ?? null) ? implode(', ', $l['BusinessType']) : (string)($l['BusinessType'] ?? ''),
+                (string)($l['MlsStatus'] ?? ($l['StandardStatus'] ?? '')),
+                (string)($l['ListingId'] ?? $key),
+                (string)($l['PublicRemarks'] ?? ''),
+                (string)($l['ListOfficeName'] ?? ''),
+                $yn($l['InternetAddressDisplayYN'] ?? null),
+                (string)($l['BuildingAreaTotal'] ?? ''),
+                !empty($l['OriginalEntryTimestamp']) ? gmdate('Y-m-d', strtotime($l['OriginalEntryTimestamp'])) : null,
+                isset($l['ModificationTimestamp']) ? gmdate('Y-m-d H:i:s', strtotime($l['ModificationTimestamp'])) : null,
+                $prev['first_seen'] ?: gmdate('Y-m-d H:i:s'),
+                $prev['lat'], $prev['lng'], $prev['photos'],
+                pack_raw($l),
+            ]);
+            $batch[] = $key;
+            $count++;
+        }
+        foreach (array_chunk($batch, 20) as $chunk) sync_photos($chunk, $token, 3);
+        $batch = [];
+        if ($maxmod) meta_set('vow_last', gmdate('Y-m-d H:i:s', strtotime($maxmod)));
+        $url = $body['@odata.nextLink'] ?? null;
+        $pages++;
+    }
+    $cut = gmdate('Y-m-d', strtotime("-$lookback days"));
+    $pg = db()->prepare("DELETE FROM listings WHERE feed = 'vow' AND ((close_date IS NOT NULL AND close_date < ?) OR (close_date IS NULL AND modified < ?))");
+    $pg->execute([$cut, $cut . ' 00:00:00']);
+    $more = ($url !== null);
+    meta_set('vow_lock', '0');
+    meta_set('vow_last_result', "$count upserted, $pages pages" . ($err ? ", ERROR: $err" : '') . ', ' . gmdate('Y-m-d H:i:s'));
+    if (!$err) meta_set('last_error', '');
     return ['upserted' => $count, 'pages' => $pages, 'more' => $more || (bool)$err, 'error' => $err];
 }
 
@@ -294,7 +383,22 @@ $path = parse_url($_SERVER['REQUEST_URI'], PHP_URL_PATH) ?: '/';
 if ($path === '/health') {
     $n = (int)db()->query("SELECT COUNT(*) FROM listings WHERE status = 'Active'")->fetchColumn();
     $t = (int)db()->query('SELECT COUNT(*) FROM listings')->fetchColumn();
-    jout(['ok' => true, 'engine' => VERSION, 'active_listings' => $n, 'total_rows' => $t, 'last_sync' => meta_get('last_sync'), 'last_result' => meta_get('last_sync_result'), 'last_error' => meta_get('last_error')]);
+    $v = (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'vow'")->fetchColumn();
+    $vs = (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'vow' AND status = 'Sold'")->fetchColumn();
+    jout(['ok' => true, 'engine' => VERSION, 'active_listings' => $n, 'vow_rows' => $v, 'vow_sold' => $vs, 'total_rows' => $t,
+        'last_sync' => meta_get('last_sync'), 'last_result' => meta_get('last_sync_result'),
+        'vow_last' => meta_get('vow_last'), 'vow_result' => meta_get('vow_last_result'),
+        'last_error' => meta_get('last_error') ?: null]);
+}
+
+if ($path === '/v1/vow/sync') {
+    if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
+    try { jout(run_vow_sync(min(50, max(1, (int)($_GET['pages'] ?? 15))))); }
+    catch (Throwable $e) {
+        meta_set('vow_lock', '0');
+        meta_set('last_error', get_class($e) . ': ' . $e->getMessage() . ' @ line ' . $e->getLine());
+        jout(['error' => $e->getMessage(), 'line' => $e->getLine()], 500);
+    }
 }
 
 if ($path === '/v1/sync') {
@@ -346,6 +450,51 @@ if ($path === '/v1/probe') {
         $out['sample_sold_records'] = $b['value'] ?? [];
     } catch (Throwable $e) {}
     jout(['probe' => $out]);
+}
+
+if ($path === '/v1/vow/listings') {
+    $where = ["feed = 'vow'"]; $args = [];
+    if (!empty($_GET['status'])) { $where[] = 'status = ?'; $args[] = $_GET['status']; }
+    $cities = array_filter(is_array($_GET['city'] ?? null) ? $_GET['city'] : (isset($_GET['city']) ? [$_GET['city']] : []));
+    if ($cities) { $where[] = 'city IN (' . implode(',', array_fill(0, count($cities), '?')) . ')'; $args = array_merge($args, $cities); }
+    if (!empty($_GET['q'])) { $where[] = '(address LIKE ? OR remarks LIKE ?)'; $l = '%' . $_GET['q'] . '%'; array_push($args, $l, $l); }
+    if (!empty($_GET['type'])) { $where[] = 'property_type LIKE ?'; $args[] = '%' . $_GET['type'] . '%'; }
+    if (!empty($_GET['pmin'])) { $where[] = 'COALESCE(close_price, list_price) >= ?'; $args[] = (float)$_GET['pmin']; }
+    if (!empty($_GET['pmax'])) { $where[] = 'COALESCE(close_price, list_price) <= ?'; $args[] = (float)$_GET['pmax']; }
+    $order = match ($_GET['sort'] ?? '') {
+        'price_asc' => 'COALESCE(close_price, list_price) ASC',
+        'price_desc' => 'COALESCE(close_price, list_price) DESC',
+        default => 'COALESCE(close_date, modified) DESC',
+    };
+    $pp = min(50, max(1, (int)($_GET['pp'] ?? 12)));
+    $page = max(1, (int)($_GET['page'] ?? 1));
+    $wsql = implode(' AND ', $where);
+    $st = db()->prepare("SELECT COUNT(*) FROM listings WHERE $wsql");
+    $st->execute($args);
+    $total = (int)$st->fetchColumn();
+    $st = db()->prepare("SELECT listing_key, list_price, price_unit, close_price, close_date, status, address, city, province,
+        property_type, property_subtype, transaction_type, mls_number, sqft, list_date, photos, disp_addr
+        FROM listings WHERE $wsql ORDER BY $order LIMIT " . (($page - 1) * $pp) . ", $pp");
+    $st->execute($args);
+    $rows = [];
+    foreach ($st->fetchAll() as $r) {
+        $r['photos'] = json_decode($r['photos'] ?? '[]', true) ?: [];
+        if ($r['disp_addr'] !== 'Y') $r['address'] = '';
+        unset($r['disp_addr']);
+        $rows[] = $r;
+    }
+    jout(['total' => $total, 'page' => $page, 'pages' => (int)ceil($total / $pp), 'listings' => $rows]);
+}
+if (preg_match('#^/v1/vow/listing/([A-Za-z0-9]+)$#', $path, $mv)) {
+    $st = db()->prepare("SELECT * FROM listings WHERE listing_key = ? AND feed = 'vow'");
+    $st->execute([$mv[1]]);
+    $r = $st->fetch();
+    if (!$r) jout(['error' => 'not found'], 404);
+    $r['photos'] = json_decode($r['photos'] ?? '[]', true) ?: [];
+    $r['fields'] = unpack_raw($r['raw']);
+    unset($r['raw']);
+    if ($r['disp_addr'] !== 'Y') $r['address'] = '';
+    jout($r);
 }
 
 if ($path === '/v1/listings') jout(q_listings());
