@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.3.1 — Central Commercial Realty
+ * CC Listing Engine v0.4.0 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.3.1';
+const VERSION  = '0.4.0';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -66,6 +66,11 @@ function ensure_schema(): void {
         KEY city (city), KEY status (status), KEY modified (modified), KEY price (list_price)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci");
     db()->exec("CREATE TABLE IF NOT EXISTS meta (k VARCHAR(60) PRIMARY KEY, v TEXT)");
+    db()->exec("CREATE TABLE IF NOT EXISTS geocache (
+        addr_hash CHAR(32) PRIMARY KEY,
+        lat DECIMAL(10,7) NOT NULL,
+        lng DECIMAL(10,7) NOT NULL
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
     foreach (["ALTER TABLE listings ADD COLUMN close_price DECIMAL(14,2) NULL",
               "ALTER TABLE listings ADD COLUMN close_date DATE NULL",
               "ALTER TABLE listings ADD INDEX close_date (close_date)"] as $ddl) {
@@ -314,6 +319,70 @@ function run_vow_sync(int $max_pages = 15): array {
     return ['upserted' => $count, 'pages' => $pages, 'more' => $more || (bool)$err, 'error' => $err];
 }
 
+/* ---------------- GEOCODING ---------------- */
+
+function geo_lookup(string $q): ?array {
+    // Photon (komoot) primary
+    $url = 'https://photon.komoot.io/api/?' . http_build_query(['q' => $q, 'limit' => 1, 'lang' => 'en']);
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 12, CURLOPT_USERAGENT => 'CCListingEngine/1.0 (info@centralcommercial.ca)']);
+    $body = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE); curl_close($ch);
+    if ($body !== false && $code === 200) {
+        $j = json_decode($body, true);
+        $c = $j['features'][0]['geometry']['coordinates'] ?? null;
+        if ($c && isset($c[0], $c[1])) return ['lat' => (float)$c[1], 'lng' => (float)$c[0]];
+    }
+    // Nominatim fallback
+    $url = 'https://nominatim.openstreetmap.org/search?' . http_build_query(['q' => $q, 'format' => 'json', 'limit' => 1]);
+    $ch = curl_init($url);
+    curl_setopt_array($ch, [CURLOPT_RETURNTRANSFER => true, CURLOPT_TIMEOUT => 12, CURLOPT_USERAGENT => 'CCListingEngine/1.0 (info@centralcommercial.ca)']);
+    $body = curl_exec($ch); $code = curl_getinfo($ch, CURLINFO_RESPONSE_CODE); curl_close($ch);
+    if ($body !== false && $code === 200) {
+        $j = json_decode($body, true);
+        if (!empty($j[0]['lat'])) return ['lat' => (float)$j[0]['lat'], 'lng' => (float)$j[0]['lon']];
+    }
+    return null;
+}
+
+/** Geocode a batch: cache-first (instant), then live lookups at ~1/sec. Commercial IDX first. */
+function run_geocode(int $limit = 60): array {
+    if (meta_get('geo_lock') && time() - (int)meta_get('geo_lock') < 240) return ['skipped' => 'lock'];
+    meta_set('geo_lock', (string)time());
+    set_time_limit(0);
+    ignore_user_abort(true);
+    $rows = db()->query("SELECT listing_key, address, city, province, postal FROM listings
+        WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''
+        ORDER BY (CASE WHEN property_type LIKE '%Commercial%' OR business_type <> '' THEN 0 ELSE 1 END), modified DESC
+        LIMIT " . max(1, min(200, $limit)))->fetchAll();
+    $upd = db()->prepare("UPDATE listings SET lat = ?, lng = ? WHERE listing_key = ?");
+    $cget = db()->prepare("SELECT lat, lng FROM geocache WHERE addr_hash = ?");
+    $cput = db()->prepare("REPLACE INTO geocache (addr_hash, lat, lng) VALUES (?, ?, ?)");
+    $done = 0; $cachehits = 0; $live = 0;
+    foreach ($rows as $r) {
+        $q = implode(', ', array_filter([$r['address'], $r['city'], $r['province'] ?: 'Ontario', $r['postal'], 'Canada']));
+        $h = md5(strtolower($q));
+        $cget->execute([$h]);
+        if ($hit = $cget->fetch()) {
+            $upd->execute([$hit['lat'], $hit['lng'], $r['listing_key']]);
+            $done++; $cachehits++;
+            continue;
+        }
+        if ($live >= 45) continue; // stay under provider limits per run
+        $c = geo_lookup($q);
+        $live++;
+        if ($c) {
+            $upd->execute([$c['lat'], $c['lng'], $r['listing_key']]);
+            $cput->execute([$h, $c['lat'], $c['lng']]);
+            $done++;
+        }
+        usleep(1100000); // ~1/sec
+    }
+    $missing = (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''")->fetchColumn();
+    meta_set('geo_lock', '0');
+    meta_set('geo_last_result', "$done geocoded ($cachehits cache), $missing missing, " . gmdate('Y-m-d H:i:s'));
+    return ['geocoded' => $done, 'from_cache' => $cachehits, 'missing' => $missing];
+}
+
 /* ---------------- QUERY API ---------------- */
 
 function q_listings(): array {
@@ -393,7 +462,31 @@ if ($path === '/health') {
     jout(['ok' => true, 'engine' => VERSION, 'active_listings' => $n, 'vow_rows' => $v, 'vow_sold' => $vs, 'total_rows' => $t,
         'last_sync' => meta_get('last_sync'), 'last_result' => meta_get('last_sync_result'),
         'vow_last' => meta_get('vow_last'), 'vow_result' => meta_get('vow_last_result'),
+        'geocache' => (int)db()->query('SELECT COUNT(*) FROM geocache')->fetchColumn(),
+        'geo_result' => meta_get('geo_last_result'),
         'last_error' => meta_get('last_error') ?: null]);
+}
+
+if ($path === '/v1/geocode') {
+    if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
+    try { jout(run_geocode(max(1, min(200, (int)($_GET['limit'] ?? 60))))); }
+    catch (Throwable $e) { meta_set('geo_lock', '0'); jout(['error' => $e->getMessage(), 'line' => $e->getLine()], 500); }
+}
+
+if ($path === '/v1/geocache/import') {
+    if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
+    // Body: CSV lines "addr_hash,lat,lng" (export of the WordPress geocache table)
+    $body = file_get_contents('php://input');
+    if (!$body) jout(['error' => 'empty body — POST CSV lines: addr_hash,lat,lng'], 400);
+    $cput = db()->prepare("REPLACE INTO geocache (addr_hash, lat, lng) VALUES (?, ?, ?)");
+    $n = 0;
+    foreach (preg_split('/\r?\n/', $body) as $line) {
+        $p = str_getcsv(trim($line));
+        if (count($p) < 3 || strlen($p[0]) !== 32 || !is_numeric($p[1]) || !is_numeric($p[2])) continue;
+        $cput->execute([$p[0], (float)$p[1], (float)$p[2]]);
+        $n++;
+    }
+    jout(['imported' => $n]);
 }
 
 if ($path === '/v1/vow/sync') {
