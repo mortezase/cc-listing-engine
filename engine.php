@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.3.0 — Central Commercial Realty
+ * CC Listing Engine v0.3.1 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.3.0';
+const VERSION  = '0.3.1';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -299,9 +299,14 @@ function run_vow_sync(int $max_pages = 15): array {
         $url = $body['@odata.nextLink'] ?? null;
         $pages++;
     }
-    $cut = gmdate('Y-m-d', strtotime("-$lookback days"));
-    $pg = db()->prepare("DELETE FROM listings WHERE feed = 'vow' AND ((close_date IS NOT NULL AND close_date < ?) OR (close_date IS NULL AND modified < ?))");
-    $pg->execute([$cut, $cut . ' 00:00:00']);
+    // Retention: keep VOW records forever by default (the archive grows past the feed's
+    // 2-year window over time). Set VOW_RETAIN_DAYS>0 to enforce a purge window instead.
+    $retain = (int)env('VOW_RETAIN_DAYS', '0');
+    if ($retain > 0) {
+        $cut = gmdate('Y-m-d', strtotime("-$retain days"));
+        $pg = db()->prepare("DELETE FROM listings WHERE feed = 'vow' AND ((close_date IS NOT NULL AND close_date < ?) OR (close_date IS NULL AND modified < ?))");
+        $pg->execute([$cut, $cut . ' 00:00:00']);
+    }
     $more = ($url !== null);
     meta_set('vow_lock', '0');
     meta_set('vow_last_result', "$count upserted, $pages pages" . ($err ? ", ERROR: $err" : '') . ', ' . gmdate('Y-m-d H:i:s'));
