@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.0 — Central Commercial Realty
+ * CC Listing Engine v0.4.1 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.0';
+const VERSION  = '0.4.1';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -350,37 +350,53 @@ function run_geocode(int $limit = 60): array {
     meta_set('geo_lock', (string)time());
     set_time_limit(0);
     ignore_user_abort(true);
-    $rows = db()->query("SELECT listing_key, address, city, province, postal FROM listings
-        WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''
-        ORDER BY (CASE WHEN property_type LIKE '%Commercial%' OR business_type <> '' THEN 0 ELSE 1 END), modified DESC
-        LIMIT " . max(1, min(200, $limit)))->fetchAll();
     $upd = db()->prepare("UPDATE listings SET lat = ?, lng = ? WHERE listing_key = ?");
     $cget = db()->prepare("SELECT lat, lng FROM geocache WHERE addr_hash = ?");
     $cput = db()->prepare("REPLACE INTO geocache (addr_hash, lat, lng) VALUES (?, ?, ?)");
-    $done = 0; $cachehits = 0; $live = 0;
+    $done = 0; $cachehits = 0; $live = 0; $first_err = '';
+    // PASS 1 — cache sweep: no network, so process THOUSANDS per run until the cache is drained
+    $rows = db()->query("SELECT listing_key, address, city, province, postal FROM listings
+        WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''
+        LIMIT 4000")->fetchAll();
     foreach ($rows as $r) {
         $q = implode(', ', array_filter([$r['address'], $r['city'], $r['province'] ?: 'Ontario', $r['postal'], 'Canada']));
-        $h = md5(strtolower($q));
-        $cget->execute([$h]);
+        $cget->execute([md5(strtolower($q))]);
         if ($hit = $cget->fetch()) {
             $upd->execute([$hit['lat'], $hit['lng'], $r['listing_key']]);
             $done++; $cachehits++;
-            continue;
         }
-        if ($live >= 45) continue; // stay under provider limits per run
-        $c = geo_lookup($q);
+    }
+    // PASS 2 — live lookups: commercial & business first, rate-limited
+    $rows = db()->query("SELECT listing_key, address, city, province, postal FROM listings
+        WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''
+        ORDER BY (CASE WHEN property_type LIKE '%Commercial%' OR business_type <> '' THEN 0 ELSE 1 END), modified DESC
+        LIMIT " . max(1, min(60, $limit)))->fetchAll();
+    foreach ($rows as $r) {
+        if ($live >= 45) break;
+        $q = implode(', ', array_filter([$r['address'], $r['city'], $r['province'] ?: 'Ontario', $r['postal'], 'Canada']));
+        $h = md5(strtolower($q));
+        $cget->execute([$h]);
+        if ($cget->fetch()) continue; // pass 1 may have raced it
+        try {
+            $c = geo_lookup($q);
+        } catch (Throwable $e) {
+            $c = null;
+            if (!$first_err) $first_err = $e->getMessage();
+        }
         $live++;
         if ($c) {
             $upd->execute([$c['lat'], $c['lng'], $r['listing_key']]);
             $cput->execute([$h, $c['lat'], $c['lng']]);
             $done++;
+        } elseif (!$first_err) {
+            $first_err = 'lookup returned no result for: ' . mb_substr($q, 0, 60);
         }
-        usleep(1100000); // ~1/sec
+        usleep(1100000);
     }
     $missing = (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''")->fetchColumn();
     meta_set('geo_lock', '0');
-    meta_set('geo_last_result', "$done geocoded ($cachehits cache), $missing missing, " . gmdate('Y-m-d H:i:s'));
-    return ['geocoded' => $done, 'from_cache' => $cachehits, 'missing' => $missing];
+    meta_set('geo_last_result', "$done geocoded ($cachehits cache, $live live), $missing missing" . ($first_err ? ", first issue: $first_err" : '') . ', ' . gmdate('Y-m-d H:i:s'));
+    return ['geocoded' => $done, 'from_cache' => $cachehits, 'live_attempts' => $live, 'missing' => $missing, 'first_issue' => $first_err ?: null];
 }
 
 /* ---------------- QUERY API ---------------- */
