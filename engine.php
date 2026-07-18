@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.1 — Central Commercial Realty
+ * CC Listing Engine v0.4.2 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.1';
+const VERSION  = '0.4.2';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -354,18 +354,15 @@ function run_geocode(int $limit = 60): array {
     $cget = db()->prepare("SELECT lat, lng FROM geocache WHERE addr_hash = ?");
     $cput = db()->prepare("REPLACE INTO geocache (addr_hash, lat, lng) VALUES (?, ?, ?)");
     $done = 0; $cachehits = 0; $live = 0; $first_err = '';
-    // PASS 1 — cache sweep: no network, so process THOUSANDS per run until the cache is drained
-    $rows = db()->query("SELECT listing_key, address, city, province, postal FROM listings
-        WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''
-        LIMIT 4000")->fetchAll();
-    foreach ($rows as $r) {
-        $q = implode(', ', array_filter([$r['address'], $r['city'], $r['province'] ?: 'Ontario', $r['postal'], 'Canada']));
-        $cget->execute([md5(strtolower($q))]);
-        if ($hit = $cget->fetch()) {
-            $upd->execute([$hit['lat'], $hit['lng'], $r['listing_key']]);
-            $done++; $cachehits++;
-        }
-    }
+    // PASS 1 — cache sweep as ONE JOIN: the whole missing set vs the whole cache, in seconds.
+    // Hash construction mirrors the WordPress plugin exactly (so imported cache entries match).
+    $cachehits = db()->exec("UPDATE listings l
+        JOIN geocache g ON g.addr_hash = MD5(LOWER(CONCAT_WS(', ',
+            NULLIF(l.address, ''), NULLIF(l.city, ''),
+            COALESCE(NULLIF(l.province, ''), 'Ontario'), NULLIF(l.postal, ''), 'Canada')))
+        SET l.lat = g.lat, l.lng = g.lng
+        WHERE l.lat IS NULL AND l.address <> ''");
+    $done += (int)$cachehits;
     // PASS 2 — live lookups: commercial & business first, rate-limited
     $rows = db()->query("SELECT listing_key, address, city, province, postal FROM listings
         WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''
@@ -373,12 +370,17 @@ function run_geocode(int $limit = 60): array {
         LIMIT " . max(1, min(60, $limit)))->fetchAll();
     foreach ($rows as $r) {
         if ($live >= 45) break;
+        // Cache key: WP-compatible construction. Lookup query: de-duplicated (feed addresses
+        // already contain city/province/postal — appending them again breaks the geocoders).
         $q = implode(', ', array_filter([$r['address'], $r['city'], $r['province'] ?: 'Ontario', $r['postal'], 'Canada']));
         $h = md5(strtolower($q));
+        $lookup = ($r['city'] && stripos($r['address'], $r['city']) !== false)
+            ? $r['address'] . ', Canada'
+            : $q;
         $cget->execute([$h]);
         if ($cget->fetch()) continue; // pass 1 may have raced it
         try {
-            $c = geo_lookup($q);
+            $c = geo_lookup($lookup);
         } catch (Throwable $e) {
             $c = null;
             if (!$first_err) $first_err = $e->getMessage();
@@ -389,7 +391,7 @@ function run_geocode(int $limit = 60): array {
             $cput->execute([$h, $c['lat'], $c['lng']]);
             $done++;
         } elseif (!$first_err) {
-            $first_err = 'lookup returned no result for: ' . mb_substr($q, 0, 60);
+            $first_err = 'no result for: ' . mb_substr($lookup, 0, 80);
         }
         usleep(1100000);
     }
