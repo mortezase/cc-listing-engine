@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.2 — Central Commercial Realty
+ * CC Listing Engine v0.4.3 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.2';
+const VERSION  = '0.4.3';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -354,15 +354,36 @@ function run_geocode(int $limit = 60): array {
     $cget = db()->prepare("SELECT lat, lng FROM geocache WHERE addr_hash = ?");
     $cput = db()->prepare("REPLACE INTO geocache (addr_hash, lat, lng) VALUES (?, ?, ?)");
     $done = 0; $cachehits = 0; $live = 0; $first_err = '';
-    // PASS 1 — cache sweep as ONE JOIN: the whole missing set vs the whole cache, in seconds.
-    // Hash construction mirrors the WordPress plugin exactly (so imported cache entries match).
-    $cachehits = db()->exec("UPDATE listings l
-        JOIN geocache g ON g.addr_hash = MD5(LOWER(CONCAT_WS(', ',
-            NULLIF(l.address, ''), NULLIF(l.city, ''),
-            COALESCE(NULLIF(l.province, ''), 'Ontario'), NULLIF(l.postal, ''), 'Canada')))
-        SET l.lat = g.lat, l.lng = g.lng
-        WHERE l.lat IS NULL AND l.address <> ''");
-    $done += (int)$cachehits;
+    // PASS 1 — full cache sweep with hashes computed in PHP (MySQL 9 removed MD5()).
+    // Load the whole cache into memory (45k x 32 bytes — trivial), then stream the
+    // missing listings through it in chunks and batch the updates.
+    $cache = [];
+    foreach (db()->query("SELECT addr_hash, lat, lng FROM geocache") as $g) {
+        $cache[$g['addr_hash']] = [$g['lat'], $g['lng']];
+    }
+    if ($cache) {
+        $lastkey = '';
+        while (true) {
+            $st = db()->prepare("SELECT listing_key, address, city, province, postal FROM listings
+                WHERE lat IS NULL AND address <> '' AND listing_key > ?
+                ORDER BY listing_key LIMIT 10000");
+            $st->execute([$lastkey]);
+            $chunk = $st->fetchAll();
+            if (!$chunk) break;
+            db()->beginTransaction();
+            foreach ($chunk as $r) {
+                $lastkey = $r['listing_key'];
+                $q = implode(', ', array_filter([$r['address'], $r['city'], $r['province'] ?: 'Ontario', $r['postal'], 'Canada']));
+                $h = md5(strtolower($q));
+                if (isset($cache[$h])) {
+                    $upd->execute([$cache[$h][0], $cache[$h][1], $r['listing_key']]);
+                    $done++; $cachehits++;
+                }
+            }
+            db()->commit();
+            if (count($chunk) < 10000) break;
+        }
+    }
     // PASS 2 — live lookups: commercial & business first, rate-limited
     $rows = db()->query("SELECT listing_key, address, city, province, postal FROM listings
         WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''
