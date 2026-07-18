@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.3 — Central Commercial Realty
+ * CC Listing Engine v0.4.5 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.3';
+const VERSION  = '0.4.5';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -71,6 +71,7 @@ function ensure_schema(): void {
         lat DECIMAL(10,7) NOT NULL,
         lng DECIMAL(10,7) NOT NULL
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+    try { db()->exec("UPDATE listings SET close_date = NULL WHERE close_date > DATE_ADD(CURDATE(), INTERVAL 1 YEAR) OR close_date < '2000-01-01'"); } catch (Throwable $e) {}
     foreach (["ALTER TABLE listings ADD COLUMN close_price DECIMAL(14,2) NULL",
               "ALTER TABLE listings ADD COLUMN close_date DATE NULL",
               "ALTER TABLE listings ADD INDEX close_date (close_date)"] as $ddl) {
@@ -274,7 +275,7 @@ function run_vow_sync(int $max_pages = 15): array {
                 isset($l['ListPrice']) ? (float)$l['ListPrice'] : null,
                 $unit,
                 isset($l['ClosePrice']) ? (float)$l['ClosePrice'] : null,
-                !empty($l['CloseDate']) ? gmdate('Y-m-d', strtotime($l['CloseDate'])) : null,
+                (!empty($l['CloseDate']) && ($cd = strtotime($l['CloseDate'])) && $cd < strtotime('+1 year') && $cd > strtotime('2000-01-01')) ? gmdate('Y-m-d', $cd) : null,
                 (string)($l['UnparsedAddress'] ?? ''),
                 (string)($l['City'] ?? ''),
                 (string)($l['StateOrProvince'] ?? 'ON'),
@@ -395,7 +396,9 @@ function run_geocode(int $limit = 60): array {
         // already contain city/province/postal — appending them again breaks the geocoders).
         $q = implode(', ', array_filter([$r['address'], $r['city'], $r['province'] ?: 'Ontario', $r['postal'], 'Canada']));
         $h = md5(strtolower($q));
-        $lookup = ($r['city'] && stripos($r['address'], $r['city']) !== false)
+        // Feed addresses ending in ", ON <postal>" are already complete; TRREB district
+        // cities ("Toronto W06") never match the address string, so test for the province.
+        $lookup = preg_match('/,\s*ON\b/i', $r['address'])
             ? $r['address'] . ', Canada'
             : $q;
         $cget->execute([$h]);
