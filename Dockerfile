@@ -1,5 +1,6 @@
 FROM php:8.3-cli-alpine
 RUN docker-php-ext-install pdo_mysql
+ENV PHP_CLI_SERVER_WORKERS=10
 WORKDIR /app
 COPY engine.php /app/engine.php
 EXPOSE 8080
