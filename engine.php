@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.5 — Central Commercial Realty
+ * CC Listing Engine v0.4.6 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.5';
+const VERSION  = '0.4.6';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -74,7 +74,10 @@ function ensure_schema(): void {
     try { db()->exec("UPDATE listings SET close_date = NULL WHERE close_date > DATE_ADD(CURDATE(), INTERVAL 1 YEAR) OR close_date < '2000-01-01'"); } catch (Throwable $e) {}
     foreach (["ALTER TABLE listings ADD COLUMN close_price DECIMAL(14,2) NULL",
               "ALTER TABLE listings ADD COLUMN close_date DATE NULL",
-              "ALTER TABLE listings ADD INDEX close_date (close_date)"] as $ddl) {
+              "ALTER TABLE listings ADD INDEX close_date (close_date)",
+              "ALTER TABLE listings ADD COLUMN sort_date DATE GENERATED ALWAYS AS (COALESCE(close_date, DATE(modified))) STORED",
+              "ALTER TABLE listings ADD INDEX feed_sort (feed, sort_date)",
+              "ALTER TABLE listings ADD INDEX feed_status (feed, status)"] as $ddl) {
         try { db()->exec($ddl); } catch (Throwable $e) { /* already applied */ }
     }
 }
@@ -604,7 +607,7 @@ if ($path === '/v1/vow/listings') {
     $order = match ($_GET['sort'] ?? '') {
         'price_asc' => 'COALESCE(close_price, list_price) ASC',
         'price_desc' => 'COALESCE(close_price, list_price) DESC',
-        default => 'COALESCE(close_date, modified) DESC',
+        default => 'sort_date DESC',
     };
     $pp = min(50, max(1, (int)($_GET['pp'] ?? 12)));
     $page = max(1, (int)($_GET['page'] ?? 1));
