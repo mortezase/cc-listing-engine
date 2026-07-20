@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.9 — Central Commercial Realty
+ * CC Listing Engine v0.4.11 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.9';
+const VERSION  = '0.4.11';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -30,7 +30,7 @@ function db(): PDO {
     $pdo = new PDO(
         'mysql:host=' . env('DB_HOST', 'mysql') . ';dbname=' . env('DB_NAME', 'listings') . ';charset=utf8mb4',
         env('DB_USER', 'listings'), env('DB_PASS', ''),
-        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC]
+        [PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION, PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC, PDO::MYSQL_ATTR_USE_BUFFERED_QUERY => true]
     );
     return $pdo;
 }
@@ -85,8 +85,8 @@ function ensure_schema(): void {
               "ALTER TABLE listings ADD INDEX feed_ptype (feed, property_type(30))",
               "ALTER TABLE listings ADD INDEX feed_sort_status (feed, sort_date, status)",
               "ALTER TABLE listings ADD INDEX first_seen_idx (first_seen)"] as $ddl) {
-    // Refresh cardinalities so the optimizer picks the new indexes correctly
-    try { db()->exec("ANALYZE TABLE listings"); } catch (Throwable $e) {}
+    // ANALYZE moved off the boot path (was blocking startup) — call /v1/optimize?key=SYNC_KEY once after
+    // indexes finish building. Boot is now clean & fast; the optimizer settles as syncs run anyway.
         try { db()->exec($ddl); } catch (Throwable $e) { /* already applied */ }
     }
 }
@@ -537,6 +537,16 @@ if ($path === '/v1/geocode') {
     if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
     try { jout(run_geocode(max(1, min(200, (int)($_GET['limit'] ?? 60))))); }
     catch (Throwable $e) { meta_set('geo_lock', '0'); jout(['error' => $e->getMessage(), 'line' => $e->getLine()], 500); }
+}
+
+if ($path === '/v1/optimize') {
+    if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
+    set_time_limit(0);
+    try {
+        db()->exec("ANALYZE TABLE listings");
+        db()->exec("ANALYZE TABLE geocache");
+        jout(['ok' => true, 'analyzed' => ['listings', 'geocache']]);
+    } catch (Throwable $e) { jout(['error' => $e->getMessage()], 500); }
 }
 
 if ($path === '/v1/geocache/import') {
