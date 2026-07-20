@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.6 — Central Commercial Realty
+ * CC Listing Engine v0.4.7 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.6';
+const VERSION  = '0.4.7';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -77,7 +77,10 @@ function ensure_schema(): void {
               "ALTER TABLE listings ADD INDEX close_date (close_date)",
               "ALTER TABLE listings ADD COLUMN sort_date DATE GENERATED ALWAYS AS (COALESCE(close_date, DATE(modified))) STORED",
               "ALTER TABLE listings ADD INDEX feed_sort (feed, sort_date)",
-              "ALTER TABLE listings ADD INDEX feed_status (feed, status)"] as $ddl) {
+              "ALTER TABLE listings ADD INDEX feed_status (feed, status)",
+              "ALTER TABLE listings ADD INDEX feed_status_city (feed, status, city)",
+              "ALTER TABLE listings ADD INDEX feed_status_modified (feed, status, modified)",
+              "ALTER TABLE listings ADD INDEX feed_status_price (feed, status, list_price)"] as $ddl) {
         try { db()->exec($ddl); } catch (Throwable $e) { /* already applied */ }
     }
 }
@@ -460,7 +463,7 @@ function q_listings(): array {
         'newest' => 'list_date DESC',
         'price_asc' => 'list_price ASC',
         'price_desc' => 'list_price DESC',
-        default => 'modified DESC',
+        default => 'modified DESC', // uses feed_status_modified index
     };
     $pp = min(50, max(1, (int)($_GET['pp'] ?? 12)));
     $page = max(1, (int)($_GET['page'] ?? 1));
