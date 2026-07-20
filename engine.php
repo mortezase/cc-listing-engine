@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.8 — Central Commercial Realty
+ * CC Listing Engine v0.4.9 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.8';
+const VERSION  = '0.4.9';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -80,7 +80,13 @@ function ensure_schema(): void {
               "ALTER TABLE listings ADD INDEX feed_status (feed, status)",
               "ALTER TABLE listings ADD INDEX feed_status_city (feed, status, city)",
               "ALTER TABLE listings ADD INDEX feed_status_modified (feed, status, modified)",
-              "ALTER TABLE listings ADD INDEX feed_status_price (feed, status, list_price)"] as $ddl) {
+              "ALTER TABLE listings ADD INDEX feed_status_price (feed, status, list_price)",
+              "ALTER TABLE listings ADD INDEX feed_txn_city (feed, transaction_type(15), city)",
+              "ALTER TABLE listings ADD INDEX feed_ptype (feed, property_type(30))",
+              "ALTER TABLE listings ADD INDEX feed_sort_status (feed, sort_date, status)",
+              "ALTER TABLE listings ADD INDEX first_seen_idx (first_seen)"] as $ddl) {
+    // Refresh cardinalities so the optimizer picks the new indexes correctly
+    try { db()->exec("ANALYZE TABLE listings"); } catch (Throwable $e) {}
         try { db()->exec($ddl); } catch (Throwable $e) { /* already applied */ }
     }
 }
@@ -656,6 +662,43 @@ if (preg_match('#^/v1/vow/listing/([A-Za-z0-9]+)$#', $path, $mv)) {
 }
 
 if ($path === '/v1/listings') jout(q_listings());
+if ($path === '/v1/landing') {
+    $out = [];
+    // Fresh IDX (few, small, uses first_seen_idx)
+    $st = db()->prepare("SELECT listing_key, list_price, price_unit, address, city, province, property_type, property_subtype,
+        transaction_type, business_type, mls_number, list_date, photos, disp_addr, lat, lng
+        FROM listings WHERE feed = 'idx' AND status = 'Active' AND perm_adv = 'Y' ORDER BY first_seen DESC LIMIT 8");
+    $st->execute();
+    $fresh = [];
+    foreach ($st->fetchAll() as $r) {
+        $r['photos'] = json_decode($r['photos'] ?? '[]', true) ?: [];
+        if ($r['disp_addr'] !== 'Y') $r['address'] = '';
+        unset($r['disp_addr']);
+        $fresh[] = $r;
+    }
+    $out['fresh'] = $fresh;
+    // Recent VOW sales (small, indexed)
+    $st = db()->prepare("SELECT listing_key, close_price, list_price, price_unit, close_date, status, address, city, province,
+        property_type, property_subtype, transaction_type, mls_number, photos, disp_addr
+        FROM listings WHERE feed = 'vow' AND status = 'Sold' AND close_date IS NOT NULL
+        ORDER BY close_date DESC LIMIT 8");
+    $st->execute();
+    $recent_sales = [];
+    foreach ($st->fetchAll() as $r) {
+        $r['photos'] = json_decode($r['photos'] ?? '[]', true) ?: [];
+        if ($r['disp_addr'] !== 'Y') $r['address'] = '';
+        unset($r['disp_addr']);
+        $recent_sales[] = $r;
+    }
+    $out['recent_sales'] = $recent_sales;
+    // Counts for pills
+    $out['counts'] = [
+        'business_sale' => (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'idx' AND status = 'Active' AND perm_adv = 'Y' AND (business_type <> '' OR property_subtype LIKE '%Business%')")->fetchColumn(),
+        'commercial_lease' => (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'idx' AND status = 'Active' AND perm_adv = 'Y' AND transaction_type LIKE '%Lease%' AND property_type LIKE '%Commercial%'")->fetchColumn(),
+    ];
+    jout($out);
+}
+
 if (preg_match('#^/v1/listing/([A-Za-z0-9]+)$#', $path, $m)) jout(q_listing($m[1]));
 if ($path === '/v1/cities') {
     $rows = db()->query("SELECT city, COUNT(*) n FROM listings WHERE status = 'Active' AND city <> '' GROUP BY city ORDER BY n DESC LIMIT 100")->fetchAll();
