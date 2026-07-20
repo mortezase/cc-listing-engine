@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.7 — Central Commercial Realty
+ * CC Listing Engine v0.4.8 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.7';
+const VERSION  = '0.4.8';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -138,24 +138,36 @@ function unpack_raw(?string $s): array {
 
 /* ---------------- SYNC ---------------- */
 
-function sync_photos(array $keys, string $token, int $cap = 12): void {
+function sync_photos(array $keys, string $token, int $cap = 30): void {
     if (!$keys) return;
     $flt = implode(' or ', array_map(fn($k) => "ResourceRecordKey eq '" . $k . "'", $keys));
+    // Pull larger set + Order + ImageSizeDescription so we can pick ONE photo per Order slot
     $url = API_BASE . 'Media?' . http_build_query([
         '$filter' => "($flt) and ResourceName eq 'Property' and MediaCategory eq 'Photo'",
-        '$select' => 'ResourceRecordKey,MediaURL,Order',
-        '$orderby' => 'Order', '$top' => 500,
+        '$select' => 'ResourceRecordKey,MediaURL,Order,ImageSizeDescription',
+        '$orderby' => 'Order', '$top' => 2000,
     ], '', '&', PHP_QUERY_RFC3986);
     try { $body = http_get_json($url, $token); } catch (Throwable) { return; }
-    $byKey = [];
+    // Group by ResourceKey, then by Order — keep the largest variant per Order.
+    $rank = ['Largest' => 3, 'Large' => 2, 'Medium' => 1, 'Thumbnail' => 0];
+    $grouped = [];
     foreach (($body['value'] ?? []) as $m) {
         $k = $m['ResourceRecordKey'] ?? '';
         $u = $m['MediaURL'] ?? '';
+        $o = isset($m['Order']) ? (int)$m['Order'] : 0;
         if (!$k || !$u) continue;
-        if (count($byKey[$k] ?? []) < $cap) $byKey[$k][] = $u;
+        $sz = $rank[$m['ImageSizeDescription'] ?? ''] ?? 1;
+        if (!isset($grouped[$k][$o]) || $sz > $grouped[$k][$o]['sz']) {
+            $grouped[$k][$o] = ['url' => $u, 'sz' => $sz];
+        }
     }
     $st = db()->prepare("UPDATE listings SET photos = ? WHERE listing_key = ?");
-    foreach ($byKey as $k => $urls) $st->execute([json_encode($urls), $k]);
+    foreach ($grouped as $k => $orders) {
+        ksort($orders);
+        $urls = [];
+        foreach ($orders as $o) { $urls[] = $o['url']; if (count($urls) >= $cap) break; }
+        $st->execute([json_encode(array_values($urls)), $k]);
+    }
 }
 
 function run_sync(int $max_pages = 15): array {
