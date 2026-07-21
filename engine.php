@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.12 — Central Commercial Realty
+ * CC Listing Engine v0.4.13 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.12';
+const VERSION  = '0.4.13';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -752,6 +752,50 @@ if ($path === '/v1/landing') {
         'commercial_lease' => (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'idx' AND status = 'Active' AND perm_adv = 'Y' AND transaction_type LIKE '%Lease%' AND property_type LIKE '%Commercial%'")->fetchColumn(),
     ];
     jout($out);
+}
+
+if (preg_match('#^/v1/similar/([A-Za-z0-9]+)$#', $path, $ms)) {
+    $key = $ms[1];
+    // Load source listing's key attributes
+    $src = db()->prepare("SELECT feed, property_type, business_type, city, list_price, list_price+0 as p FROM listings WHERE listing_key = ?");
+    $src->execute([$key]);
+    $sr = $src->fetch();
+    if (!$sr) jout(['listings' => []]);
+    $where = ['listing_key <> ?', 'photos <> "[]" AND photos IS NOT NULL'];
+    $args = [$key];
+    // Match feed + same broad category
+    $where[] = 'feed = ?'; $args[] = $sr['feed'];
+    if ($sr['business_type']) {
+        // Business: match businesses in same city or nearby
+        $where[] = "business_type <> ''";
+    } elseif (stripos($sr['property_type'], 'Commercial') !== false) {
+        $where[] = "property_type LIKE '%Commercial%'";
+    } else {
+        $where[] = "property_type NOT LIKE '%Commercial%'";
+    }
+    // Same city (highest similarity)
+    if ($sr['city']) { $where[] = 'city = ?'; $args[] = $sr['city']; }
+    // Only active for IDX, or same status for VOW
+    if ($sr['feed'] === 'idx') $where[] = "status = 'Active'";
+    // Price within ±30% when available
+    if ($sr['p'] > 0) {
+        $where[] = 'list_price BETWEEN ? AND ?';
+        $args[] = $sr['p'] * 0.7;
+        $args[] = $sr['p'] * 1.3;
+    }
+    $wsql = implode(' AND ', $where);
+    $st = db()->prepare("SELECT listing_key, list_price, price_unit, close_price, close_date, address, city, province,
+        property_type, property_subtype, business_type, sqft, photos, disp_addr
+        FROM listings WHERE $wsql ORDER BY " . ($sr['feed'] === 'vow' ? 'close_date DESC' : 'modified DESC') . " LIMIT 4");
+    $st->execute($args);
+    $rows = [];
+    foreach ($st->fetchAll() as $r) {
+        $r['photos'] = json_decode($r['photos'] ?? '[]', true) ?: [];
+        if ($r['disp_addr'] !== 'Y') $r['address'] = '';
+        unset($r['disp_addr']);
+        $rows[] = $r;
+    }
+    jout(['listings' => $rows]);
 }
 
 if (preg_match('#^/v1/listing/([A-Za-z0-9]+)$#', $path, $m)) jout(q_listing($m[1]));
