@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.11 — Central Commercial Realty
+ * CC Listing Engine v0.4.12 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.11';
+const VERSION  = '0.4.12';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -147,31 +147,37 @@ function unpack_raw(?string $s): array {
 function sync_photos(array $keys, string $token, int $cap = 30): void {
     if (!$keys) return;
     $flt = implode(' or ', array_map(fn($k) => "ResourceRecordKey eq '" . $k . "'", $keys));
-    // Pull larger set + Order + ImageSizeDescription so we can pick ONE photo per Order slot
     $url = API_BASE . 'Media?' . http_build_query([
         '$filter' => "($flt) and ResourceName eq 'Property' and MediaCategory eq 'Photo'",
         '$select' => 'ResourceRecordKey,MediaURL,Order,ImageSizeDescription',
-        '$orderby' => 'Order', '$top' => 2000,
+        '$orderby' => 'Order', '$top' => 4000,
     ], '', '&', PHP_QUERY_RFC3986);
     try { $body = http_get_json($url, $token); } catch (Throwable) { return; }
-    // Group by ResourceKey, then by Order — keep the largest variant per Order.
+    // Dedupe by BASE IMAGE identity (the trailing base64 path segment in TRREB URLs is stable across size variants).
+    // Keep the largest variant per base image; preserve original Order for gallery sequence.
     $rank = ['Largest' => 3, 'Large' => 2, 'Medium' => 1, 'Thumbnail' => 0];
     $grouped = [];
     foreach (($body['value'] ?? []) as $m) {
         $k = $m['ResourceRecordKey'] ?? '';
         $u = $m['MediaURL'] ?? '';
-        $o = isset($m['Order']) ? (int)$m['Order'] : 0;
         if (!$k || !$u) continue;
+        $o = isset($m['Order']) ? (int)$m['Order'] : 0;
         $sz = $rank[$m['ImageSizeDescription'] ?? ''] ?? 1;
-        if (!isset($grouped[$k][$o]) || $sz > $grouped[$k][$o]['sz']) {
-            $grouped[$k][$o] = ['url' => $u, 'sz' => $sz];
+        // Base image key = the final path segment before .jpg/.jpeg/.png (that's the stable image identifier)
+        $bid = preg_match('#/([^/.?]+)\.(?:jpe?g|png|webp)(?:\?|$)#i', $u, $mm) ? $mm[1] : md5($u);
+        // If we've seen this base image already, keep the LARGER variant; if same size, keep the one with the lower Order (earlier in the gallery)
+        if (isset($grouped[$k][$bid])) {
+            if ($sz > $grouped[$k][$bid]['sz']) { $grouped[$k][$bid] = ['url' => $u, 'sz' => $sz, 'order' => $o]; }
+            elseif ($sz === $grouped[$k][$bid]['sz'] && $o < $grouped[$k][$bid]['order']) { $grouped[$k][$bid]['order'] = $o; }
+        } else {
+            $grouped[$k][$bid] = ['url' => $u, 'sz' => $sz, 'order' => $o];
         }
     }
     $st = db()->prepare("UPDATE listings SET photos = ? WHERE listing_key = ?");
-    foreach ($grouped as $k => $orders) {
-        ksort($orders);
-        $urls = [];
-        foreach ($orders as $o) { $urls[] = $o['url']; if (count($urls) >= $cap) break; }
+    foreach ($grouped as $k => $imgs) {
+        // Sort by Order — preserves the listing agent's intended photo sequence
+        uasort($imgs, fn($a, $b) => $a['order'] <=> $b['order']);
+        $urls = array_slice(array_column($imgs, 'url'), 0, $cap);
         $st->execute([json_encode(array_values($urls)), $k]);
     }
 }
@@ -537,6 +543,45 @@ if ($path === '/v1/geocode') {
     if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
     try { jout(run_geocode(max(1, min(200, (int)($_GET['limit'] ?? 60))))); }
     catch (Throwable $e) { meta_set('geo_lock', '0'); jout(['error' => $e->getMessage(), 'line' => $e->getLine()], 500); }
+}
+
+if ($path === '/v1/rephoto') {
+    if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
+    $token = env('IDX_TOKEN');
+    $vow_token = env('VOW_TOKEN');
+    if (!$token && !$vow_token) jout(['error' => 'no tokens available'], 500);
+    if (meta_get('rephoto_lock') && time() - (int)meta_get('rephoto_lock') < 240) jout(['skipped' => 'lock']);
+    meta_set('rephoto_lock', (string)time());
+    set_time_limit(0);
+    ignore_user_abort(true);
+    $feed = in_array($_GET['feed'] ?? '', ['idx', 'vow'], true) ? $_GET['feed'] : 'idx';
+    $tok  = ($feed === 'vow') ? ($vow_token ?: $token) : ($token ?: $vow_token);
+    $batch = max(20, min(200, (int)($_GET['batch'] ?? 100)));
+    // Cursor: highest listing_key already rephoto'd for this feed
+    $cursor_key = 'rephoto_' . $feed . '_cursor';
+    $cur = meta_get($cursor_key, '');
+    $st = db()->prepare("SELECT listing_key FROM listings
+        WHERE feed = ? AND (photos IS NULL OR photos = '' OR photos = '[]' OR JSON_LENGTH(photos) <= 3) AND listing_key > ?
+        ORDER BY listing_key LIMIT ?");
+    $st->bindValue(1, $feed);
+    $st->bindValue(2, $cur);
+    $st->bindValue(3, $batch, PDO::PARAM_INT);
+    $st->execute();
+    $keys = array_column($st->fetchAll(), 'listing_key');
+    $processed = 0;
+    if ($keys) {
+        foreach (array_chunk($keys, 20) as $chunk) {
+            sync_photos($chunk, $tok, $feed === 'vow' ? 3 : 30);
+            $processed += count($chunk);
+        }
+        meta_set($cursor_key, end($keys));
+    } else {
+        meta_set($cursor_key, ''); // wrap around
+    }
+    $remaining = (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = '$feed' AND (photos IS NULL OR photos = '' OR photos = '[]' OR JSON_LENGTH(photos) <= 3)")->fetchColumn();
+    meta_set('rephoto_lock', '0');
+    meta_set('rephoto_last_result', "feed=$feed processed=$processed remaining=$remaining " . gmdate('Y-m-d H:i:s'));
+    jout(['processed' => $processed, 'more' => count($keys) === $batch, 'remaining' => $remaining, 'cursor' => end($keys) ?: null, 'feed' => $feed]);
 }
 
 if ($path === '/v1/optimize') {
