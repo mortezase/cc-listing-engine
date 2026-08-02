@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.13 — Central Commercial Realty
+ * CC Listing Engine v0.4.14 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.13';
+const VERSION  = '0.4.14';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -714,6 +714,37 @@ if (preg_match('#^/v1/vow/listing/([A-Za-z0-9]+)$#', $path, $mv)) {
     unset($r['raw']);
     if ($r['disp_addr'] !== 'Y') $r['address'] = '';
     jout($r);
+}
+
+if ($path === '/v1/export') {
+    // Bulk mirror export: cursor pagination by listing_key, optional ?since= for incremental.
+    $feed = in_array($_GET['feed'] ?? 'idx', ['idx', 'vow'], true) ? ($_GET['feed'] ?? 'idx') : 'idx';
+    $cursor = preg_replace('/[^A-Za-z0-9]/', '', (string)($_GET['cursor'] ?? ''));
+    $since = (string)($_GET['since'] ?? '');
+    $limit = max(100, min(2000, (int)($_GET['limit'] ?? 1000)));
+    $where = ['feed = ?']; $args = [$feed];
+    if ($feed === 'idx') $where[] = "status = 'Active'";
+    if ($cursor) { $where[] = 'listing_key > ?'; $args[] = $cursor; }
+    if ($since && preg_match('/^\d{4}-\d{2}-\d{2}[T ]?[\d:]*/', $since)) { $where[] = 'modified >= ?'; $args[] = str_replace('T', ' ', substr($since, 0, 19)); }
+    $wsql = implode(' AND ', $where);
+    $st = db()->prepare("SELECT listing_key, list_price, price_unit, close_price, close_date, status, address, city, province, postal,
+        property_type, property_subtype, transaction_type, business_type, property_use, zoning, mls_number, sqft, lot_size,
+        remarks, list_office, perm_adv, disp_addr, lat, lng, photos, list_date, modified
+        FROM listings WHERE $wsql ORDER BY listing_key LIMIT $limit");
+    $st->execute($args);
+    $rows = $st->fetchAll();
+    $last = $rows ? end($rows)['listing_key'] : null;
+    // Also report deletions for incremental syncs: keys that vanished (status flip / purge) are found by
+    // the mirror noticing keys it has that we no longer return; provide a count endpoint for verification.
+    jout(['rows' => $rows, 'next_cursor' => count($rows) === $limit ? $last : null, 'count' => count($rows)]);
+}
+
+if ($path === '/v1/export/keys') {
+    // All active keys for the feed — lets the mirror prune stale rows cheaply.
+    $feed = in_array($_GET['feed'] ?? 'idx', ['idx', 'vow'], true) ? ($_GET['feed'] ?? 'idx') : 'idx';
+    $where = $feed === 'idx' ? "feed = 'idx' AND status = 'Active'" : "feed = 'vow'";
+    $keys = db()->query("SELECT listing_key FROM listings WHERE $where ORDER BY listing_key")->fetchAll(PDO::FETCH_COLUMN);
+    jout(['keys' => $keys, 'count' => count($keys)]);
 }
 
 if ($path === '/v1/listings') jout(q_listings());
