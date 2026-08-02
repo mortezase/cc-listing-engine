@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.14 — Central Commercial Realty
+ * CC Listing Engine v0.4.15 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -20,7 +20,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.14';
+const VERSION  = '0.4.15';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -728,7 +728,7 @@ if ($path === '/v1/export') {
     if ($since && preg_match('/^\d{4}-\d{2}-\d{2}[T ]?[\d:]*/', $since)) { $where[] = 'modified >= ?'; $args[] = str_replace('T', ' ', substr($since, 0, 19)); }
     $wsql = implode(' AND ', $where);
     $st = db()->prepare("SELECT listing_key, list_price, price_unit, close_price, close_date, status, address, city, province, postal,
-        property_type, property_subtype, transaction_type, business_type, property_use, zoning, mls_number, sqft, lot_size,
+        property_type, property_subtype, transaction_type, business_type, mls_number, sqft,
         remarks, list_office, perm_adv, disp_addr, lat, lng, photos, list_date, modified
         FROM listings WHERE $wsql ORDER BY listing_key LIMIT $limit");
     $st->execute($args);
