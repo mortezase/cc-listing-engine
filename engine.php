@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.17 — Central Commercial Realty
+ * CC Listing Engine v0.4.19 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -21,7 +21,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.17';
+const VERSION  = '0.4.19';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -85,7 +85,8 @@ function ensure_schema(): void {
               "ALTER TABLE listings ADD INDEX feed_txn_city (feed, transaction_type(15), city)",
               "ALTER TABLE listings ADD INDEX feed_ptype (feed, property_type(30))",
               "ALTER TABLE listings ADD INDEX feed_sort_status (feed, sort_date, status)",
-              "ALTER TABLE listings ADD INDEX first_seen_idx (first_seen)"] as $ddl) {
+              "ALTER TABLE listings ADD INDEX first_seen_idx (first_seen)",
+              "ALTER TABLE listings ADD COLUMN property_use VARCHAR(190) NULL"] as $ddl) {
     // ANALYZE moved off the boot path (was blocking startup) — call /v1/optimize?key=SYNC_KEY once after
     // indexes finish building. Boot is now clean & fast; the optimizer settles as syncs run anyway.
         try { db()->exec($ddl); } catch (Throwable $e) { /* already applied */ }
@@ -204,8 +205,8 @@ function run_sync(int $max_pages = 15): array {
     $up = db()->prepare("REPLACE INTO listings
         (listing_key, feed, list_price, price_unit, address, city, province, postal, property_type, property_subtype,
          transaction_type, business_type, status, mls_number, remarks, list_office, perm_adv, disp_addr, sqft,
-         list_date, modified, first_seen, lat, lng, photos, raw)
-        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+         list_date, modified, first_seen, lat, lng, photos, raw, property_use)
+        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
     $err = null;
     while ($url && $pages < $max_pages) {
@@ -244,6 +245,7 @@ function run_sync(int $max_pages = 15): array {
                 $prev['first_seen'] ?: gmdate('Y-m-d H:i:s'),
                 $prev['lat'], $prev['lng'], $prev['photos'],
                 pack_raw($l),
+                is_array($l['PropertyUse'] ?? null) ? implode(', ', $l['PropertyUse']) : (string)($l['PropertyUse'] ?? ''),
             ]);
             $batch[] = $key;
             $count++;
@@ -622,6 +624,29 @@ if ($path === '/v1/vow/sync') {
     }
 }
 
+if ($path === '/v1/backfill/use') {
+    // Fill property_use (e.g. "Without Property") on existing IDX rows from their stored full record.
+    // Time-capped; call repeatedly until "remaining" is 0.
+    if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
+    set_time_limit(0);
+    $t0 = microtime(true); $done = 0;
+    $sel = db()->prepare("SELECT listing_key, raw FROM listings WHERE feed = 'idx' AND property_use IS NULL LIMIT 500");
+    $upd = db()->prepare("UPDATE listings SET property_use = ? WHERE listing_key = ?");
+    while (microtime(true) - $t0 < 20) {
+        $sel->execute();
+        $rows = $sel->fetchAll();
+        if (!$rows) break;
+        foreach ($rows as $r) {
+            $rec = unpack_raw($r['raw']);
+            $u = $rec['PropertyUse'] ?? '';
+            $upd->execute([is_array($u) ? implode(', ', $u) : (string)$u, $r['listing_key']]);
+            $done++;
+        }
+    }
+    $left = (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'idx' AND property_use IS NULL")->fetchColumn();
+    jout(['filled' => $done, 'remaining' => $left, 'done' => $left === 0]);
+}
+
 if ($path === '/v1/fieldscan') {
     // Broker-only report: scans every stored full PropTx record ON THIS SERVER and shows field usage
     // as an HTML page in the browser. Aggregates only (field names, value counts) — no listing rows.
@@ -630,13 +655,18 @@ if ($path === '/v1/fieldscan') {
     $feed = in_array($_GET['feed'] ?? 'idx', ['idx', 'vow'], true) ? ($_GET['feed'] ?? 'idx') : 'idx';
     $find = trim((string)($_GET['find'] ?? 'sale of business'));
     $where = $feed === 'idx' ? "feed = 'idx' AND status = 'Active'" : "feed = 'vow'";
-    $max = max(1000, min(2000000, (int)($_GET['max'] ?? 200000)));
+    if (empty($_GET['all'])) $where .= " AND property_type LIKE '%Commercial%'";   // commercial only unless &all=1
+    // Bounded so the single-threaded engine is never tied up: default 3,000 records / 20 seconds.
+    $max = max(500, min(50000, (int)($_GET['max'] ?? 3000)));
+    $secs = max(5, min(45, (int)($_GET['secs'] ?? 20)));
+    $t0 = microtime(true); $stopped = false;
     $fields = [];   // name => ['n' => listings having it, 'vals' => [value => count], 'many' => bool]
     $hits = [];     // name => [value => count] where value contains $find
     $types = [];    // PropertyType | PropertySubType => count
     $scanned = 0; $noraw = 0; $cursor = '';
-    $st = db()->prepare("SELECT listing_key, raw FROM listings WHERE $where AND listing_key > ? ORDER BY listing_key LIMIT 1000");
+    $st = db()->prepare("SELECT listing_key, raw FROM listings WHERE $where AND listing_key > ? ORDER BY listing_key LIMIT 250");
     while ($scanned < $max) {
+        if (microtime(true) - $t0 > $secs) { $stopped = true; break; }
         $st->execute([$cursor]);
         $rows = $st->fetchAll();
         if (!$rows) break;
@@ -667,14 +697,15 @@ if ($path === '/v1/fieldscan') {
                 unset($f);
             }
         }
-        if (count($rows) < 1000) break;
+        if (count($rows) < 250) break;
     }
     ksort($fields); arsort($types);
     $e = fn($x) => htmlspecialchars((string)$x, ENT_QUOTES, 'UTF-8');
     header('Content-Type: text/html; charset=utf-8');
     echo '<!doctype html><meta charset="utf-8"><title>Field scan</title><style>body{font:14px system-ui,sans-serif;margin:24px;color:#222}table{border-collapse:collapse;margin:8px 0 28px}td,th{border:1px solid #ddd;padding:5px 8px;text-align:left;vertical-align:top}th{background:#f4f1ec}h2{margin-top:28px}small{color:#777}</style>';
     echo '<h1>Field scan — ' . $e($feed === 'idx' ? 'active IDX listings' : 'VOW records') . '</h1>';
-    echo '<p>Scanned <b>' . number_format($scanned) . '</b> records' . ($noraw ? ' (' . number_format($noraw) . ' had no stored full record)' : '') . '. Engine ' . VERSION . '.</p>';
+    echo '<p>Scanned <b>' . number_format($scanned) . '</b> records in ' . round(microtime(true) - $t0, 1) . 's'
+        . ($stopped || $scanned >= $max ? ' (a sample — add &amp;max=10000 to scan more)' : '') . ($noraw ? ' (' . number_format($noraw) . ' had no stored full record)' : '') . '. Engine ' . VERSION . '.</p>';
     echo '<form><input type="hidden" name="key" value="' . $e($_GET['key']) . '"><input type="hidden" name="feed" value="' . $e($feed) . '">Find text in any field: <input name="find" value="' . $e($find) . '"> <button>Scan</button></form>';
     echo '<h2>1. Fields containing “' . $e($find) . '”</h2>';
     if (!$hits) echo '<p>None. No stored field contains this text.</p>';
@@ -803,7 +834,7 @@ if ($path === '/v1/export') {
     if ($since && preg_match('/^\d{4}-\d{2}-\d{2}[T ]?[\d:]*/', $since)) { $where[] = 'modified >= ?'; $args[] = str_replace('T', ' ', substr($since, 0, 19)); }
     $wsql = implode(' AND ', $where);
     $st = db()->prepare("SELECT listing_key, list_price, price_unit, close_price, close_date, status, address, city, province, postal,
-        property_type, property_subtype, transaction_type, business_type, mls_number, sqft,
+        property_type, property_subtype, transaction_type, business_type, property_use, mls_number, sqft,
         remarks, list_office, perm_adv, disp_addr, lat, lng, photos, list_date, modified
         FROM listings WHERE $wsql ORDER BY listing_key LIMIT $limit");
     $st->execute($args);
