@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.15 — Central Commercial Realty
+ * CC Listing Engine v0.4.16 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -11,6 +11,7 @@
  *   GET /v1/listing/{listingKey}
  *   GET /v1/cities                       -> distinct cities with counts
  *   POST /v1/sync?key=<SYNC_KEY>         -> incremental IDX sync (call from cron)
+ *   GET  /v1/fieldscan?key=<SYNC_KEY> *   POST /v1/sync?key=<SYNC_KEY>         -> incremental IDX sync (call from cron)find=  -> broker report: field usage across stored records (HTML)
  *
  * Compliance: PropTx/AMPRE data is served ONLY to Central Commercial's own
  * authorized website(s) via API key. No AI systems. Clause 1.e respected.
@@ -20,7 +21,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.15';
+const VERSION  = '0.4.16';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -618,6 +619,79 @@ if ($path === '/v1/vow/sync') {
         meta_set('last_error', get_class($e) . ': ' . $e->getMessage() . ' @ line ' . $e->getLine());
         jout(['error' => $e->getMessage(), 'line' => $e->getLine()], 500);
     }
+}
+
+if ($path === '/v1/fieldscan') {
+    // Broker-only report: scans every stored full PropTx record ON THIS SERVER and shows field usage
+    // as an HTML page in the browser. Aggregates only (field names, value counts) — no listing rows.
+    if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
+    set_time_limit(0);
+    $feed = in_array($_GET['feed'] ?? 'idx', ['idx', 'vow'], true) ? ($_GET['feed'] ?? 'idx') : 'idx';
+    $find = trim((string)($_GET['find'] ?? 'sale of business'));
+    $where = $feed === 'idx' ? "feed = 'idx' AND status = 'Active'" : "feed = 'vow'";
+    $max = max(1000, min(2000000, (int)($_GET['max'] ?? 200000)));
+    $fields = [];   // name => ['n' => listings having it, 'vals' => [value => count], 'many' => bool]
+    $hits = [];     // name => [value => count] where value contains $find
+    $types = [];    // PropertyType | PropertySubType => count
+    $scanned = 0; $noraw = 0; $cursor = '';
+    $st = db()->prepare("SELECT listing_key, raw FROM listings WHERE $where AND listing_key > ? ORDER BY listing_key LIMIT 1000");
+    while ($scanned < $max) {
+        $st->execute([$cursor]);
+        $rows = $st->fetchAll();
+        if (!$rows) break;
+        foreach ($rows as $r) {
+            $cursor = $r['listing_key'];
+            $scanned++;
+            $rec = unpack_raw($r['raw']);
+            if (!$rec) { $noraw++; continue; }
+            $tk = trim(($rec['PropertyType'] ?? '') . ' | ' . ($rec['PropertySubType'] ?? ''));
+            $types[$tk] = ($types[$tk] ?? 0) + 1;
+            foreach ($rec as $k => $v) {
+                $f = &$fields[$k];
+                if (!$f) $f = ['n' => 0, 'vals' => [], 'many' => false];
+                $f['n']++;
+                $list = is_array($v) ? $v : [$v];
+                foreach ($list as $one) {
+                    if (!is_scalar($one)) continue;
+                    $sv = is_bool($one) ? ($one ? 'true' : 'false') : (string)$one;
+                    if ($find !== '' && stripos($sv, $find) !== false) {
+                        $hv = mb_strlen($sv) > 80 ? '(long text containing it)' : $sv;
+                        $hits[$k][$hv] = ($hits[$k][$hv] ?? 0) + 1;
+                    }
+                    // Only short, category-like values are tallied; free text / ids are skipped.
+                    if ($f['many'] || mb_strlen($sv) > 60) { if (mb_strlen($sv) > 60) $f['many'] = true; continue; }
+                    if (!isset($f['vals'][$sv]) && count($f['vals']) >= 40) { $f['many'] = true; continue; }
+                    $f['vals'][$sv] = ($f['vals'][$sv] ?? 0) + 1;
+                }
+                unset($f);
+            }
+        }
+        if (count($rows) < 1000) break;
+    }
+    ksort($fields); arsort($types);
+    $e = fn($x) => htmlspecialchars((string)$x, ENT_QUOTES, 'UTF-8');
+    header('Content-Type: text/html; charset=utf-8');
+    echo '<!doctype html><meta charset="utf-8"><title>Field scan</title><style>body{font:14px system-ui,sans-serif;margin:24px;color:#222}table{border-collapse:collapse;margin:8px 0 28px}td,th{border:1px solid #ddd;padding:5px 8px;text-align:left;vertical-align:top}th{background:#f4f1ec}h2{margin-top:28px}small{color:#777}</style>';
+    echo '<h1>Field scan — ' . $e($feed === 'idx' ? 'active IDX listings' : 'VOW records') . '</h1>';
+    echo '<p>Scanned <b>' . number_format($scanned) . '</b> records' . ($noraw ? ' (' . number_format($noraw) . ' had no stored full record)' : '') . '. Engine ' . VERSION . '.</p>';
+    echo '<form><input type="hidden" name="key" value="' . $e($_GET['key']) . '"><input type="hidden" name="feed" value="' . $e($feed) . '">Find text in any field: <input name="find" value="' . $e($find) . '"> <button>Scan</button></form>';
+    echo '<h2>1. Fields containing “' . $e($find) . '”</h2>';
+    if (!$hits) echo '<p>None. No stored field contains this text.</p>';
+    else { echo '<table><tr><th>Field</th><th>Value</th><th>Listings</th></tr>';
+        foreach ($hits as $k => $vals) { arsort($vals); foreach ($vals as $v => $c) echo '<tr><td><code>' . $e($k) . '</code></td><td>' . $e($v) . '</td><td>' . number_format($c) . '</td></tr>'; }
+        echo '</table>'; }
+    echo '<h2>2. Property type | Type (subtype)</h2><table><tr><th>PropertyType | PropertySubType</th><th>Listings</th></tr>';
+    foreach ($types as $k => $c) echo '<tr><td>' . $e($k) . '</td><td>' . number_format($c) . '</td></tr>';
+    echo '</table>';
+    echo '<h2>3. Every field in the feed</h2><p><small>Values are listed only for short, category-like fields (40 distinct values or fewer).</small></p><table><tr><th>Field</th><th>Listings with it</th><th>Values (count)</th></tr>';
+    foreach ($fields as $k => $f) {
+        $vals = '';
+        if (!$f['many'] && $f['vals']) { arsort($f['vals']); $parts = []; foreach ($f['vals'] as $v => $c) $parts[] = $e($v) . ' <small>(' . number_format($c) . ')</small>'; $vals = implode(' · ', $parts); }
+        elseif ($f['many']) $vals = '<small>many / free text</small>';
+        echo '<tr><td><code>' . $e($k) . '</code></td><td>' . number_format($f['n']) . '</td><td>' . $vals . '</td></tr>';
+    }
+    echo '</table>';
+    exit;
 }
 
 if ($path === '/v1/sync') {
