@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.16 — Central Commercial Realty
+ * CC Listing Engine v0.4.17 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -21,7 +21,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.16';
+const VERSION  = '0.4.17';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -385,7 +385,7 @@ function run_geocode(int $limit = 60): array {
     $upd = db()->prepare("UPDATE listings SET lat = ?, lng = ? WHERE listing_key = ?");
     $cget = db()->prepare("SELECT lat, lng FROM geocache WHERE addr_hash = ?");
     $cput = db()->prepare("REPLACE INTO geocache (addr_hash, lat, lng) VALUES (?, ?, ?)");
-    $done = 0; $cachehits = 0; $live = 0; $first_err = '';
+    $done = 0; $cachehits = 0; $live = 0; $first_err = ''; $notfound = 0;
     // PASS 1 — full cache sweep with hashes computed in PHP (MySQL 9 removed MD5()).
     // Load the whole cache into memory (45k x 32 bytes — trivial), then stream the
     // missing listings through it in chunks and batch the updates.
@@ -445,15 +445,15 @@ function run_geocode(int $limit = 60): array {
             $upd->execute([$c['lat'], $c['lng'], $r['listing_key']]);
             $cput->execute([$h, $c['lat'], $c['lng']]);
             $done++;
-        } elseif (!$first_err) {
-            $first_err = 'no result for: ' . mb_substr($lookup, 0, 80);
+        } else {
+            $notfound++;   // count only — never store an address
         }
         usleep(1100000);
     }
     $missing = (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'idx' AND status = 'Active' AND lat IS NULL AND disp_addr = 'Y' AND address <> ''")->fetchColumn();
     meta_set('geo_lock', '0');
-    meta_set('geo_last_result', "$done geocoded ($cachehits cache, $live live), $missing missing" . ($first_err ? ", first issue: $first_err" : '') . ', ' . gmdate('Y-m-d H:i:s'));
-    return ['geocoded' => $done, 'from_cache' => $cachehits, 'live_attempts' => $live, 'missing' => $missing, 'first_issue' => $first_err ?: null];
+    meta_set('geo_last_result', "$done geocoded ($cachehits cache, $live live), $missing missing" . ($notfound ? ", $notfound not found" : '') . ($first_err ? ', lookup error: ' . mb_substr($first_err, 0, 60) : '') . ', ' . gmdate('Y-m-d H:i:s'));
+    return ['geocoded' => $done, 'from_cache' => $cachehits, 'live_attempts' => $live, 'missing' => $missing, 'not_found' => $notfound, 'first_issue' => $first_err ?: null];
 }
 
 /* ---------------- QUERY API ---------------- */
@@ -536,7 +536,8 @@ if ($path === '/health') {
         'last_sync' => meta_get('last_sync'), 'last_result' => meta_get('last_sync_result'),
         'vow_last' => meta_get('vow_last'), 'vow_result' => meta_get('vow_last_result'),
         'geocache' => (int)db()->query('SELECT COUNT(*) FROM geocache')->fetchColumn(),
-        'geo_result' => meta_get('geo_last_result'),
+        // Public endpoint: counts only. Strip any older stored text that named an address.
+        'geo_result' => preg_replace('/, first issue:.*?(?=, \d{4}-\d{2}-\d{2}|$)/', '', (string)meta_get('geo_last_result')),
         'last_error' => meta_get('last_error') ?: null]);
 }
 
