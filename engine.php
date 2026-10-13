@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.20 — Central Commercial Realty
+ * CC Listing Engine v0.4.22 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -21,7 +21,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.20';
+const VERSION  = '0.4.22';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -86,7 +86,8 @@ function ensure_schema(): void {
               "ALTER TABLE listings ADD INDEX feed_ptype (feed, property_type(30))",
               "ALTER TABLE listings ADD INDEX feed_sort_status (feed, sort_date, status)",
               "ALTER TABLE listings ADD INDEX first_seen_idx (first_seen)",
-              "ALTER TABLE listings ADD COLUMN property_use VARCHAR(190) NULL"] as $ddl) {
+              "ALTER TABLE listings ADD COLUMN property_use VARCHAR(190) NULL",
+              "ALTER TABLE listings ADD COLUMN mls_status VARCHAR(60) NULL"] as $ddl) {
     // ANALYZE moved off the boot path (was blocking startup) — call /v1/optimize?key=SYNC_KEY once after
     // indexes finish building. Boot is now clean & fast; the optimizer settles as syncs run anyway.
         try { db()->exec($ddl); } catch (Throwable $e) { /* already applied */ }
@@ -184,6 +185,22 @@ function sync_photos(array $keys, string $token, int $cap = 30): void {
     }
 }
 
+/** Status to store: the feed's StandardStatus, except an "Active" listing past its ExpirationDate counts as Expired. */
+function effective_status(array $l): string {
+    $st = (string)($l['StandardStatus'] ?? 'Active');
+    if ($st !== 'Active') return $st;
+    // TRREB MlsStatus decides availability. Hidden: sold/leased (firm), expired, terminated, suspended, withdrawn.
+    // Kept: New, Price Change, Extension, Deal Fell Through, Sold/Leased Conditional (+ Escape).
+    $ms = strtolower(trim((string)($l['MlsStatus'] ?? '')));
+    $hide = ['sold' => 'Sold', 'sld' => 'Sold', 'leased' => 'Leased', 'lsd' => 'Leased', 'expired' => 'Expired', 'exp' => 'Expired',
+             'terminated' => 'Terminated', 'ter' => 'Terminated', 'suspended' => 'Suspended', 'sus' => 'Suspended',
+             'withdrawn' => 'Withdrawn', 'cancelled' => 'Cancelled', 'canceled' => 'Cancelled'];
+    if (isset($hide[$ms])) return $hide[$ms];
+    $exp = (string)($l['ExpirationDate'] ?? '');
+    if ($exp !== '' && strtotime(substr($exp, 0, 10)) !== false && substr($exp, 0, 10) < gmdate('Y-m-d')) return 'Expired';
+    return 'Active';
+}
+
 /** Insert/update one active IDX record (shared by the incremental sync and /v1/refresh). */
 function idx_upsert(array $l): void {
     static $sel = null, $up = null;
@@ -192,8 +209,8 @@ function idx_upsert(array $l): void {
         $up = db()->prepare("REPLACE INTO listings
         (listing_key, feed, list_price, price_unit, address, city, province, postal, property_type, property_subtype,
          transaction_type, business_type, status, mls_number, remarks, list_office, perm_adv, disp_addr, sqft,
-         list_date, modified, first_seen, lat, lng, photos, raw, property_use)
-        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+         list_date, modified, first_seen, lat, lng, photos, raw, property_use, mls_status)
+        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
     }
     $key = $l['ListingKey'] ?? '';
     if (!$key) return;
@@ -214,7 +231,7 @@ function idx_upsert(array $l): void {
         (string)($l['PropertySubType'] ?? ''),
         (string)($l['TransactionType'] ?? ''),
         is_array($l['BusinessType'] ?? null) ? implode(', ', $l['BusinessType']) : (string)($l['BusinessType'] ?? ''),
-        (string)($l['StandardStatus'] ?? 'Active'),
+        effective_status($l),
         (string)($l['ListingId'] ?? $key),
         (string)($l['PublicRemarks'] ?? ''),
         (string)($l['ListOfficeName'] ?? ''),
@@ -227,6 +244,7 @@ function idx_upsert(array $l): void {
         $prev['lat'], $prev['lng'], $prev['photos'],
         pack_raw($l),
         is_array($l['PropertyUse'] ?? null) ? implode(', ', $l['PropertyUse']) : (string)($l['PropertyUse'] ?? ''),
+        (string)($l['MlsStatus'] ?? ''),
     ]);
 }
 
@@ -657,6 +675,31 @@ if ($path === '/v1/backfill/use') {
     jout(['filled' => $done, 'remaining' => $left, 'done' => $left === 0]);
 }
 
+if ($path === '/v1/backfill/status') {
+    // One-time: store MlsStatus for existing IDX rows and apply the availability rule (sold, leased, expired,
+    // terminated, suspended → hidden). Time-capped; call repeatedly until "done": true.
+    if (($_GET['key'] ?? '') !== env('SYNC_KEY', '')) jout(['error' => 'invalid sync key'], 401);
+    set_time_limit(0);
+    $t0 = microtime(true); $done = 0; $hidden = 0;
+    $sel = db()->prepare("SELECT listing_key, raw FROM listings WHERE feed = 'idx' AND mls_status IS NULL LIMIT 500");
+    $upd = db()->prepare("UPDATE listings SET mls_status = ?, status = ? WHERE listing_key = ?");
+    while (microtime(true) - $t0 < 20) {
+        $sel->execute();
+        $rows = $sel->fetchAll();
+        if (!$rows) break;
+        foreach ($rows as $r) {
+            $rec = unpack_raw($r['raw']);
+            if (!$rec) { db()->prepare("UPDATE listings SET mls_status = '' WHERE listing_key = ?")->execute([$r['listing_key']]); $done++; continue; }
+            $st = effective_status($rec);
+            if ($st !== 'Active') $hidden++;
+            $upd->execute([(string)($rec['MlsStatus'] ?? ''), $st, $r['listing_key']]);
+            $done++;
+        }
+    }
+    $left = (int)db()->query("SELECT COUNT(*) FROM listings WHERE feed = 'idx' AND mls_status IS NULL")->fetchColumn();
+    jout(['checked' => $done, 'newly_hidden' => $hidden, 'remaining' => $left, 'done' => $left === 0]);
+}
+
 if ($path === '/v1/fieldscan') {
     // Broker-only report: scans every stored full PropTx record ON THIS SERVER and shows field usage
     // as an HTML page in the browser. Aggregates only (field names, value counts) — no listing rows.
@@ -844,7 +887,7 @@ if ($path === '/v1/export') {
     if ($since && preg_match('/^\d{4}-\d{2}-\d{2}[T ]?[\d:]*/', $since)) { $where[] = 'modified >= ?'; $args[] = str_replace('T', ' ', substr($since, 0, 19)); }
     $wsql = implode(' AND ', $where);
     $st = db()->prepare("SELECT listing_key, list_price, price_unit, close_price, close_date, status, address, city, province, postal,
-        property_type, property_subtype, transaction_type, business_type, property_use, mls_number, sqft,
+        property_type, property_subtype, transaction_type, business_type, property_use, mls_status, mls_number, sqft,
         remarks, list_office, perm_adv, disp_addr, lat, lng, photos, list_date, modified
         FROM listings WHERE $wsql ORDER BY listing_key LIMIT $limit");
     $st->execute($args);
@@ -880,9 +923,10 @@ if ($path === '/v1/refresh') {
         foreach (($body['value'] ?? []) as $l) {
             $k = $l['ListingKey'] ?? ''; if (!$k) continue;
             $seen[$k] = true;
-            if (($l['StandardStatus'] ?? '') === 'Active') { idx_upsert($l); $active[] = $k; }
+            $st = effective_status($l);
+            if ($st === 'Active') { idx_upsert($l); $active[] = $k; }
             else {
-                db()->prepare("UPDATE listings SET status = ? WHERE listing_key = ? AND feed = 'idx'")->execute([(string)($l['StandardStatus'] ?? 'Off Market'), $k]);
+                db()->prepare("UPDATE listings SET status = ? WHERE listing_key = ? AND feed = 'idx'")->execute([$st, $k]);
                 $off[] = $k;
             }
         }
