@@ -1,6 +1,6 @@
 <?php
 /**
- * CC Listing Engine v0.4.19 — Central Commercial Realty
+ * CC Listing Engine v0.4.20 — Central Commercial Realty
  * Single-file listing API + AMPRE sync service (runs on EasyPanel, PHP built-in server).
  *
  * ENV: DB_HOST, DB_NAME, DB_USER, DB_PASS, IDX_TOKEN, API_KEY, SYNC_KEY
@@ -21,7 +21,7 @@ error_reporting(E_ALL & ~E_DEPRECATED);
 date_default_timezone_set('UTC');
 
 const API_BASE = 'https://query.ampre.ca/odata/';
-const VERSION  = '0.4.19';
+const VERSION  = '0.4.20';
 
 function env($k, $d = null) { $v = getenv($k); return $v === false ? $d : $v; }
 
@@ -184,6 +184,52 @@ function sync_photos(array $keys, string $token, int $cap = 30): void {
     }
 }
 
+/** Insert/update one active IDX record (shared by the incremental sync and /v1/refresh). */
+function idx_upsert(array $l): void {
+    static $sel = null, $up = null;
+    if (!$sel) {
+        $sel = db()->prepare("SELECT first_seen, lat, lng, photos FROM listings WHERE listing_key = ?");
+        $up = db()->prepare("REPLACE INTO listings
+        (listing_key, feed, list_price, price_unit, address, city, province, postal, property_type, property_subtype,
+         transaction_type, business_type, status, mls_number, remarks, list_office, perm_adv, disp_addr, sqft,
+         list_date, modified, first_seen, lat, lng, photos, raw, property_use)
+        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
+    }
+    $key = $l['ListingKey'] ?? '';
+    if (!$key) return;
+    $yn = fn($v) => ($v === true || $v === 'Y' || $v === 'Yes' || $v === 'true' || $v === 1) ? 'Y' : (($v === null || $v === '') ? 'Y' : 'N');
+    $unit = '';
+    foreach (['ListPriceUnit', 'LeaseAmountFrequency'] as $uf) if (!empty($l[$uf]) && is_string($l[$uf])) { $unit = $l[$uf]; break; }
+    $sel->execute([$key]);
+    $prev = $sel->fetch() ?: ['first_seen' => gmdate('Y-m-d H:i:s'), 'lat' => null, 'lng' => null, 'photos' => null];
+    $up->execute([
+        $key,
+        isset($l['ListPrice']) ? (float)$l['ListPrice'] : null,
+        $unit,
+        (string)($l['UnparsedAddress'] ?? ''),
+        (string)($l['City'] ?? ''),
+        (string)($l['StateOrProvince'] ?? 'ON'),
+        (string)($l['PostalCode'] ?? ''),
+        (string)($l['PropertyType'] ?? ''),
+        (string)($l['PropertySubType'] ?? ''),
+        (string)($l['TransactionType'] ?? ''),
+        is_array($l['BusinessType'] ?? null) ? implode(', ', $l['BusinessType']) : (string)($l['BusinessType'] ?? ''),
+        (string)($l['StandardStatus'] ?? 'Active'),
+        (string)($l['ListingId'] ?? $key),
+        (string)($l['PublicRemarks'] ?? ''),
+        (string)($l['ListOfficeName'] ?? ''),
+        $yn($l['InternetEntireListingDisplayYN'] ?? null),
+        $yn($l['InternetAddressDisplayYN'] ?? null),
+        (string)($l['BuildingAreaTotal'] ?? ''),
+        !empty($l['OriginalEntryTimestamp']) ? gmdate('Y-m-d', strtotime($l['OriginalEntryTimestamp'])) : null,
+        isset($l['ModificationTimestamp']) ? gmdate('Y-m-d H:i:s', strtotime($l['ModificationTimestamp'])) : null,
+        $prev['first_seen'] ?: gmdate('Y-m-d H:i:s'),
+        $prev['lat'], $prev['lng'], $prev['photos'],
+        pack_raw($l),
+        is_array($l['PropertyUse'] ?? null) ? implode(', ', $l['PropertyUse']) : (string)($l['PropertyUse'] ?? ''),
+    ]);
+}
+
 function run_sync(int $max_pages = 15): array {
     $token = env('IDX_TOKEN');
     if (!$token) return ['error' => 'IDX_TOKEN not set'];
@@ -201,12 +247,6 @@ function run_sync(int $max_pages = 15): array {
     ], '', '&', PHP_QUERY_RFC3986);
 
     $count = 0; $pages = 0; $maxmod = ''; $batch = [];
-    $sel = db()->prepare("SELECT first_seen, lat, lng, photos FROM listings WHERE listing_key = ?");
-    $up = db()->prepare("REPLACE INTO listings
-        (listing_key, feed, list_price, price_unit, address, city, province, postal, property_type, property_subtype,
-         transaction_type, business_type, status, mls_number, remarks, list_office, perm_adv, disp_addr, sqft,
-         list_date, modified, first_seen, lat, lng, photos, raw, property_use)
-        VALUES (?, 'idx', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)");
 
     $err = null;
     while ($url && $pages < $max_pages) {
@@ -216,37 +256,7 @@ function run_sync(int $max_pages = 15): array {
             $key = $l['ListingKey'] ?? '';
             if (!$key) continue;
             if (($l['ModificationTimestamp'] ?? '') > $maxmod) $maxmod = $l['ModificationTimestamp'];
-            $yn = fn($v) => ($v === true || $v === 'Y' || $v === 'Yes' || $v === 'true' || $v === 1) ? 'Y' : (($v === null || $v === '') ? 'Y' : 'N');
-            $unit = '';
-            foreach (['ListPriceUnit', 'LeaseAmountFrequency'] as $uf) if (!empty($l[$uf]) && is_string($l[$uf])) { $unit = $l[$uf]; break; }
-            $sel->execute([$key]);
-            $prev = $sel->fetch() ?: ['first_seen' => gmdate('Y-m-d H:i:s'), 'lat' => null, 'lng' => null, 'photos' => null];
-            $up->execute([
-                $key,
-                isset($l['ListPrice']) ? (float)$l['ListPrice'] : null,
-                $unit,
-                (string)($l['UnparsedAddress'] ?? ''),
-                (string)($l['City'] ?? ''),
-                (string)($l['StateOrProvince'] ?? 'ON'),
-                (string)($l['PostalCode'] ?? ''),
-                (string)($l['PropertyType'] ?? ''),
-                (string)($l['PropertySubType'] ?? ''),
-                (string)($l['TransactionType'] ?? ''),
-                is_array($l['BusinessType'] ?? null) ? implode(', ', $l['BusinessType']) : (string)($l['BusinessType'] ?? ''),
-                (string)($l['StandardStatus'] ?? 'Active'),
-                (string)($l['ListingId'] ?? $key),
-                (string)($l['PublicRemarks'] ?? ''),
-                (string)($l['ListOfficeName'] ?? ''),
-                $yn($l['InternetEntireListingDisplayYN'] ?? null),
-                $yn($l['InternetAddressDisplayYN'] ?? null),
-                (string)($l['BuildingAreaTotal'] ?? ''),
-                !empty($l['OriginalEntryTimestamp']) ? gmdate('Y-m-d', strtotime($l['OriginalEntryTimestamp'])) : null,
-                isset($l['ModificationTimestamp']) ? gmdate('Y-m-d H:i:s', strtotime($l['ModificationTimestamp'])) : null,
-                $prev['first_seen'] ?: gmdate('Y-m-d H:i:s'),
-                $prev['lat'], $prev['lng'], $prev['photos'],
-                pack_raw($l),
-                is_array($l['PropertyUse'] ?? null) ? implode(', ', $l['PropertyUse']) : (string)($l['PropertyUse'] ?? ''),
-            ]);
+            idx_upsert($l);
             $batch[] = $key;
             $count++;
         }
@@ -851,6 +861,38 @@ if ($path === '/v1/export/keys') {
     $where = $feed === 'idx' ? "feed = 'idx' AND status = 'Active'" : "feed = 'vow'";
     $keys = db()->query("SELECT listing_key FROM listings WHERE $where ORDER BY listing_key")->fetchAll(PDO::FETCH_COLUMN);
     jout(['keys' => $keys, 'count' => count($keys)]);
+}
+
+if ($path === '/v1/refresh') {
+    // Ask PropTx directly about specific listings (e.g. the website's featured ones) and fix them here:
+    // still active → refreshed (price, details, photos); no longer active or gone → marked off-market so
+    // /v1/listing and /v1/export stop serving them. Max 40 keys per call.
+    $token = env('IDX_TOKEN');
+    if (!$token) jout(['error' => 'IDX_TOKEN not set'], 500);
+    $keys = array_slice(array_values(array_unique(array_filter(array_map(
+        fn($k) => preg_replace('/[^A-Za-z0-9]/', '', $k), explode(',', (string)($_GET['keys'] ?? '')))))), 0, 40);
+    if (!$keys) jout(['error' => 'keys required'], 400);
+    $seen = []; $active = []; $off = [];
+    foreach (array_chunk($keys, 20) as $chunk) {
+        $f = implode(' or ', array_map(fn($k) => "ListingKey eq '$k'", $chunk));
+        try { $body = http_get_json(API_BASE . 'Property?' . http_build_query(['$filter' => $f, '$top' => 40], '', '&', PHP_QUERY_RFC3986), $token); }
+        catch (Throwable $e) { jout(['error' => 'PropTx: ' . $e->getMessage()], 502); }   // never mark anything on a failed check
+        foreach (($body['value'] ?? []) as $l) {
+            $k = $l['ListingKey'] ?? ''; if (!$k) continue;
+            $seen[$k] = true;
+            if (($l['StandardStatus'] ?? '') === 'Active') { idx_upsert($l); $active[] = $k; }
+            else {
+                db()->prepare("UPDATE listings SET status = ? WHERE listing_key = ? AND feed = 'idx'")->execute([(string)($l['StandardStatus'] ?? 'Off Market'), $k]);
+                $off[] = $k;
+            }
+        }
+    }
+    foreach ($keys as $k) if (empty($seen[$k])) {   // not in the IDX feed any more
+        db()->prepare("UPDATE listings SET status = 'Off Market' WHERE listing_key = ? AND feed = 'idx'")->execute([$k]);
+        $off[] = $k;
+    }
+    if ($active) sync_photos($active, $token);
+    jout(['active' => $active, 'off_market' => $off]);
 }
 
 if ($path === '/v1/listings') jout(q_listings());
